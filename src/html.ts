@@ -133,7 +133,7 @@ export function getHTML(): string {
 <body>
 <div class="toast" id="toast"></div>
 <div class="container">
-  <header><h1>FLIP 7</h1><p class="sub" id="headerSub">Push your luck</p></header>
+  <header><h1>FLIP 7</h1><p class="sub" id="headerSub">(for Self glazers)</p></header>
 
   <!-- LANDING -->
   <div class="screen active" id="sLanding">
