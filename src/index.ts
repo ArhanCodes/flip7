@@ -5,11 +5,10 @@ export interface Env {
 }
 
 // ============================================================
-// DECK COMPOSITION
-// Number cards: 0×1, 1×1, 2×2, 3×3, 4×4, 5×5, 6×6, 7×7, 8×8, 9×9, 10×10, 11×11, 12×12
-// Modifier cards: +2, +4, +6, +8, +8, +10, x2 (7 total)
-// Action cards: Freeze×3, Flip Three×3, Second Chance×3 (9 total)
-// Total: 1+1+2+3+4+5+6+7+8+9+10+11+12 + 7 + 9 = 78+7+9 = 94
+// DECK — Official Flip 7 composition (94 cards)
+// Number: 0×1, 1×1, 2×2, 3×3, 4×4, 5×5, 6×6, 7×7, 8×8, 9×9, 10×10, 11×11, 12×12
+// Modifier: +2, +4, +6, +8, +8, +10, x2 (7 total)
+// Action: Freeze×3, Flip Three×3, Second Chance×3 (9 total)
 // ============================================================
 
 type CardType = 'number' | 'modifier' | 'action';
@@ -18,30 +17,23 @@ type ModifierKind = '+2' | '+4' | '+6' | '+8' | '+10' | 'x2';
 
 interface Card {
   type: CardType;
-  value?: number;          // for number cards
-  modifier?: ModifierKind; // for modifier cards
-  action?: ActionKind;     // for action cards
+  value?: number;
+  modifier?: ModifierKind;
+  action?: ActionKind;
 }
 
 function buildDeck(): Card[] {
   const deck: Card[] = [];
-  // Number cards: value N appears N times (0 appears once)
   deck.push({ type: 'number', value: 0 });
   for (let n = 1; n <= 12; n++) {
     for (let i = 0; i < n; i++) {
       deck.push({ type: 'number', value: n });
     }
   }
-  // Modifier cards
   const mods: ModifierKind[] = ['+2', '+4', '+6', '+8', '+8', '+10', 'x2'];
-  for (const m of mods) {
-    deck.push({ type: 'modifier', modifier: m });
-  }
-  // Action cards
+  for (const m of mods) deck.push({ type: 'modifier', modifier: m });
   const actions: ActionKind[] = ['freeze', 'freeze', 'freeze', 'flip3', 'flip3', 'flip3', 'second-chance', 'second-chance', 'second-chance'];
-  for (const a of actions) {
-    deck.push({ type: 'action', action: a });
-  }
+  for (const a of actions) deck.push({ type: 'action', action: a });
   return deck;
 }
 
@@ -58,22 +50,25 @@ interface PlayerState {
   id: string;
   name: string;
   cards: Card[];
-  totalScore: number;     // across all rounds
-  roundScore: number;     // current round
+  totalScore: number;
+  roundScore: number;
   busted: boolean;
   stayed: boolean;
   frozen: boolean;
   hasSecondChance: boolean;
-  pendingFlip3: number;   // cards left to flip from Flip Three
-  pendingAction: Card | null; // action card to resolve (choose target)
+  flipped7: boolean;
+  pendingFlip3: number;
+  pendingAction: Card | null;
 }
 
 interface GameState {
   roomCode: string;
   players: PlayerState[];
   deck: Card[];
+  discardPile: Card[];
   phase: 'lobby' | 'playing' | 'round-end' | 'game-over';
   currentPlayerIdx: number;
+  dealerIdx: number;
   round: number;
   targetScore: number;
   lastEvent: string | null;
@@ -99,8 +94,10 @@ function createGame(): GameState {
     roomCode: generateCode(),
     players: [],
     deck: shuffle(buildDeck()),
+    discardPile: [],
     phase: 'lobby',
     currentPlayerIdx: 0,
+    dealerIdx: 0,
     round: 1,
     targetScore: 200,
     lastEvent: null,
@@ -109,12 +106,21 @@ function createGame(): GameState {
 }
 
 function drawCard(game: GameState): Card | null {
-  if (game.deck.length === 0) return null;
+  // If deck empty, reshuffle discard pile (official rule)
+  if (game.deck.length === 0) {
+    if (game.discardPile.length === 0) return null;
+    game.deck = shuffle(game.discardPile);
+    game.discardPile = [];
+  }
   return game.deck.pop()!;
 }
 
 function getNumberCards(player: PlayerState): Card[] {
   return player.cards.filter(c => c.type === 'number');
+}
+
+function getUniqueNumberCount(player: PlayerState): number {
+  return new Set(getNumberCards(player).map(c => c.value)).size;
 }
 
 function hasNumberDuplicate(player: PlayerState, newCard: Card): boolean {
@@ -124,25 +130,22 @@ function hasNumberDuplicate(player: PlayerState, newCard: Card): boolean {
 
 function calcRoundScore(player: PlayerState): number {
   const numCards = getNumberCards(player);
+  // 1. Sum of number card values
   let numSum = numCards.reduce((s, c) => s + (c.value ?? 0), 0);
 
-  // Check for x2 modifier
+  // 2. If x2 modifier, double the number sum first
   const hasX2 = player.cards.some(c => c.type === 'modifier' && c.modifier === 'x2');
   if (hasX2) numSum *= 2;
 
-  // Add other modifiers
+  // 3. Add other modifier bonuses
   const modTotal = player.cards
     .filter(c => c.type === 'modifier' && c.modifier !== 'x2')
-    .reduce((s, c) => {
-      const val = parseInt(c.modifier!.replace('+', ''));
-      return s + val;
-    }, 0);
+    .reduce((s, c) => s + parseInt(c.modifier!.replace('+', '')), 0);
 
   let total = numSum + modTotal;
 
-  // 7 unique number cards bonus (+15)
-  const uniqueNums = new Set(numCards.map(c => c.value));
-  if (uniqueNums.size >= 7) total += 15;
+  // 4. Flip 7 bonus: 7 unique number cards = +15
+  if (getUniqueNumberCount(player) >= 7) total += 15;
 
   return total;
 }
@@ -159,15 +162,12 @@ function advanceToNextPlayer(game: GameState): void {
     attempts++;
   } while (!isPlayerActive(game.players[game.currentPlayerIdx]) && attempts < n);
 
-  // Check if round is over (no active players)
-  const anyActive = game.players.some(isPlayerActive);
-  if (!anyActive) {
+  if (!game.players.some(isPlayerActive)) {
     endRound(game);
   }
 }
 
 function endRound(game: GameState): void {
-  // Calculate scores
   for (const p of game.players) {
     if (p.busted) {
       p.roundScore = 0;
@@ -177,16 +177,15 @@ function endRound(game: GameState): void {
     p.totalScore += p.roundScore;
   }
 
-  // Check for game over
-  const over200 = game.players.filter(p => p.totalScore >= game.targetScore);
-  if (over200.length > 0) {
-    const maxScore = Math.max(...over200.map(p => p.totalScore));
-    const winners = over200.filter(p => p.totalScore === maxScore);
+  const over = game.players.filter(p => p.totalScore >= game.targetScore);
+  if (over.length > 0) {
+    const maxScore = Math.max(...over.map(p => p.totalScore));
+    const winners = over.filter(p => p.totalScore === maxScore);
     if (winners.length === 1) {
       game.phase = 'game-over';
       game.winner = winners[0].name;
     } else {
-      // Tie — play another round
+      // Tie at 200+ — play another round
       game.phase = 'round-end';
     }
   } else {
@@ -200,74 +199,190 @@ function endRound(game: GameState): void {
 
 function startNewRound(game: GameState): void {
   game.round++;
-  game.deck = shuffle(buildDeck());
-  game.phase = 'playing';
-  game.lastEvent = null;
 
+  // Official rule: cards from previous round go to discard (not reshuffled)
   for (const p of game.players) {
+    game.discardPile.push(...p.cards);
     p.cards = [];
     p.roundScore = 0;
     p.busted = false;
     p.stayed = false;
     p.frozen = false;
     p.hasSecondChance = false;
+    p.flipped7 = false;
     p.pendingFlip3 = 0;
     p.pendingAction = null;
   }
 
-  // Deal one card to each player
-  game.currentPlayerIdx = 0;
-  for (const p of game.players) {
-    const card = drawCard(game);
-    if (card) dealCardToPlayer(game, p, card);
-  }
-  game.currentPlayerIdx = 0;
+  // Rotate dealer (pass deck to the left)
+  game.dealerIdx = (game.dealerIdx + 1) % game.players.length;
 
-  // Make sure current player is active
-  if (!isPlayerActive(game.players[0])) {
+  // If deck is running low, reshuffle discard into deck
+  if (game.deck.length < game.players.length * 3) {
+    game.deck = shuffle([...game.deck, ...game.discardPile]);
+    game.discardPile = [];
+  }
+
+  game.phase = 'playing';
+  game.lastEvent = null;
+
+  // Deal one card to each player starting from left of dealer
+  for (let i = 0; i < game.players.length; i++) {
+    const idx = (game.dealerIdx + 1 + i) % game.players.length;
+    const card = drawCard(game);
+    if (card) dealCardToPlayer(game, game.players[idx], card);
+  }
+
+  // First active player after dealer starts
+  game.currentPlayerIdx = (game.dealerIdx + 1) % game.players.length;
+  if (!isPlayerActive(game.players[game.currentPlayerIdx])) {
     advanceToNextPlayer(game);
   }
 }
 
+// Deal a card to a player, handling all card types per official rules
 function dealCardToPlayer(game: GameState, player: PlayerState, card: Card): string | null {
+  // === SECOND CHANCE ===
   if (card.type === 'action' && card.action === 'second-chance') {
+    if (player.hasSecondChance) {
+      // Official rule: must give to another active player without one, or discard
+      const validTarget = game.players.find(p =>
+        p.id !== player.id && isPlayerActive(p) && !p.hasSecondChance
+      );
+      if (validTarget) {
+        validTarget.hasSecondChance = true;
+        validTarget.cards.push(card);
+        return `${player.name} already has Second Chance — gave it to ${validTarget.name}`;
+      } else {
+        game.discardPile.push(card);
+        return `${player.name} already has Second Chance — discarded`;
+      }
+    }
     player.hasSecondChance = true;
     player.cards.push(card);
-    return `${player.name} got a Second Chance card`;
+    return `${player.name} drew Second Chance 🛡️`;
   }
 
+  // === FREEZE / FLIP THREE ===
   if (card.type === 'action' && (card.action === 'freeze' || card.action === 'flip3')) {
-    // Player must choose a target (including themselves)
     player.pendingAction = card;
     player.cards.push(card);
-    return `${player.name} drew ${card.action === 'freeze' ? 'Freeze' : 'Flip Three'} — choose a target`;
+    const name = card.action === 'freeze' ? 'Freeze ❄️' : 'Flip Three 🃏';
+    return `${player.name} drew ${name} — choose a target!`;
   }
 
+  // === NUMBER CARD ===
   if (card.type === 'number') {
     if (hasNumberDuplicate(player, card)) {
-      // Bust! Unless they have Second Chance
       if (player.hasSecondChance) {
+        // Second Chance saves from bust
         player.hasSecondChance = false;
-        // Remove the second chance card from their hand
         const scIdx = player.cards.findIndex(c => c.type === 'action' && c.action === 'second-chance');
-        if (scIdx >= 0) player.cards.splice(scIdx, 1);
-        return `${player.name} drew duplicate ${card.value} but used Second Chance to survive!`;
+        if (scIdx >= 0) {
+          game.discardPile.push(player.cards[scIdx]);
+          player.cards.splice(scIdx, 1);
+        }
+        game.discardPile.push(card); // duplicate goes to discard
+        return `${player.name} drew duplicate ${card.value} but Second Chance saved them! 🛡️`;
       } else {
         player.cards.push(card);
         player.busted = true;
-        return `${player.name} BUSTED on duplicate ${card.value}!`;
+        return `💥 ${player.name} BUSTED on duplicate ${card.value}!`;
+      }
+    }
+
+    player.cards.push(card);
+
+    // Check for FLIP 7 — auto-ends round for everyone!
+    if (getUniqueNumberCount(player) >= 7) {
+      player.flipped7 = true;
+      player.stayed = true;
+      // End round immediately for ALL players
+      endRound(game);
+      return `🎉 ${player.name} got FLIP 7!!! Round over for everyone!`;
+    }
+
+    return `${player.name} drew a ${card.value}`;
+  }
+
+  // === MODIFIER CARD ===
+  player.cards.push(card);
+  if (card.type === 'modifier') {
+    return `${player.name} drew ${card.modifier}`;
+  }
+  return null;
+}
+
+// Resolve Flip Three — official rules: draw 3, queue nested actions
+function resolveFlipThree(game: GameState, target: PlayerState): string[] {
+  const events: string[] = [];
+  const queuedActions: Card[] = [];
+  let cardsDrawn = 0;
+
+  while (cardsDrawn < 3 && !target.busted && game.phase === 'playing') {
+    const c = drawCard(game);
+    if (!c) break;
+    cardsDrawn++;
+
+    // Official rule: Freeze/Flip Three drawn during Flip Three resolve AFTER
+    if (c.type === 'action' && (c.action === 'freeze' || c.action === 'flip3')) {
+      target.cards.push(c);
+      queuedActions.push(c);
+      const name = c.action === 'freeze' ? 'Freeze' : 'Flip Three';
+      events.push(`${target.name} drew ${name} (resolves after)`);
+      continue;
+    }
+
+    // Second Chance can be used immediately during Flip Three
+    if (c.type === 'action' && c.action === 'second-chance') {
+      if (target.hasSecondChance) {
+        const validTarget = game.players.find(p =>
+          p.id !== target.id && isPlayerActive(p) && !p.hasSecondChance
+        );
+        if (validTarget) {
+          validTarget.hasSecondChance = true;
+          validTarget.cards.push(c);
+          events.push(`Gave Second Chance to ${validTarget.name}`);
+        } else {
+          game.discardPile.push(c);
+          events.push(`Extra Second Chance discarded`);
+        }
+      } else {
+        target.hasSecondChance = true;
+        target.cards.push(c);
+        events.push(`${target.name} got Second Chance`);
+      }
+      continue;
+    }
+
+    // Normal card (number or modifier)
+    const ev = dealCardToPlayer(game, target, c);
+    if (ev) events.push(ev);
+
+    // Stop if Flip 7 triggered or bust
+    if (game.phase !== 'playing' || target.busted) break;
+  }
+
+  target.pendingFlip3 = 0;
+
+  // Resolve queued actions if target didn't bust
+  if (!target.busted && game.phase === 'playing' && queuedActions.length > 0) {
+    // Set first queued action as pending for the target to resolve
+    target.pendingAction = queuedActions[0];
+    // Note: if there are multiple queued actions, they'd need to be resolved
+    // one at a time. For simplicity, additional ones are auto-resolved on self.
+    for (let i = 1; i < queuedActions.length; i++) {
+      const qa = queuedActions[i];
+      if (qa.action === 'freeze') {
+        // Auto-freeze self if multiple queued
+        target.frozen = true;
+        target.stayed = true;
+        events.push(`${target.name} was auto-frozen`);
       }
     }
   }
 
-  player.cards.push(card);
-
-  if (card.type === 'number') {
-    return `${player.name} drew a ${card.value}`;
-  } else if (card.type === 'modifier') {
-    return `${player.name} drew ${card.modifier}`;
-  }
-  return null;
+  return events;
 }
 
 function filterForPlayer(game: GameState, playerId: string | null): any {
@@ -276,12 +391,13 @@ function filterForPlayer(game: GameState, playerId: string | null): any {
     phase: game.phase,
     round: game.round,
     currentPlayerIdx: game.currentPlayerIdx,
+    dealerIdx: game.dealerIdx,
     lastEvent: game.lastEvent,
     winner: game.winner,
     targetScore: game.targetScore,
     deckSize: game.deck.length,
-    players: game.players.map(p => ({
-      id: p.id,
+    players: game.players.map((p, i) => ({
+      id: p.id === playerId ? p.id : undefined,
       name: p.name,
       cards: p.cards.map(c => ({
         type: c.type,
@@ -294,10 +410,13 @@ function filterForPlayer(game: GameState, playerId: string | null): any {
       busted: p.busted,
       stayed: p.stayed,
       frozen: p.frozen,
+      flipped7: p.flipped7,
       hasSecondChance: p.hasSecondChance,
       pendingFlip3: p.pendingFlip3,
       hasPendingAction: p.pendingAction !== null,
       pendingActionType: p.pendingAction?.action ?? null,
+      isDealer: i === game.dealerIdx,
+      isMe: p.id === playerId,
     })),
     _playerId: playerId,
   };
@@ -308,6 +427,15 @@ function json(data: unknown, status = 200): Response {
     status,
     headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
   });
+}
+
+function newPlayer(id: string, name: string): PlayerState {
+  return {
+    id, name, cards: [], totalScore: 0, roundScore: 0,
+    busted: false, stayed: false, frozen: false,
+    hasSecondChance: false, flipped7: false,
+    pendingFlip3: 0, pendingAction: null,
+  };
 }
 
 export default {
@@ -333,7 +461,7 @@ export default {
       return json({ roomCode: game.roomCode });
     }
 
-    // Get game state
+    // Get state
     const gameMatch = pathname.match(/^\/api\/game\/([A-Za-z0-9]{4})$/);
     if (method === 'GET' && gameMatch) {
       const code = gameMatch[1].toUpperCase();
@@ -343,7 +471,7 @@ export default {
       return json(filterForPlayer(JSON.parse(data), pid));
     }
 
-    // Join game
+    // Join
     if (method === 'POST' && pathname === '/api/join') {
       const body = await request.json() as { gameId: string; name: string };
       const code = body.gameId.toUpperCase();
@@ -356,16 +484,15 @@ export default {
 
       const name = body.name.trim();
       if (!name) return json({ error: 'Enter a name' }, 400);
-      if (game.players.some(p => p.name.toLowerCase() === name.toLowerCase())) {
-        return json({ error: 'Name taken' }, 400);
+
+      // Rejoin if same name
+      const existing = game.players.find(p => p.name.toLowerCase() === name.toLowerCase());
+      if (existing) {
+        return json({ playerId: existing.id, game: filterForPlayer(game, existing.id) });
       }
 
       const pid = generateId();
-      game.players.push({
-        id: pid, name, cards: [], totalScore: 0, roundScore: 0,
-        busted: false, stayed: false, frozen: false,
-        hasSecondChance: false, pendingFlip3: 0, pendingAction: null,
-      });
+      game.players.push(newPlayer(pid, name));
 
       await env.FLIP7.put(game.roomCode, JSON.stringify(game), { expirationTtl: 86400 });
       return json({ playerId: pid, game: filterForPlayer(game, pid) });
@@ -382,28 +509,32 @@ export default {
       if (game.players.length < 2) return json({ error: 'Need at least 2 players' }, 400);
 
       if (game.phase === 'lobby') {
-        // First round setup
         game.deck = shuffle(buildDeck());
+        game.discardPile = [];
         game.phase = 'playing';
         game.round = 1;
+        game.dealerIdx = 0;
+
         // Deal one card to each player
-        for (const p of game.players) {
+        for (let i = 0; i < game.players.length; i++) {
+          const idx = (game.dealerIdx + 1 + i) % game.players.length;
           const card = drawCard(game);
-          if (card) dealCardToPlayer(game, p, card);
+          if (card) dealCardToPlayer(game, game.players[idx], card);
         }
-        game.currentPlayerIdx = 0;
-        if (!isPlayerActive(game.players[0])) advanceToNextPlayer(game);
-        game.lastEvent = 'Round 1 — cards dealt!';
+
+        game.currentPlayerIdx = (game.dealerIdx + 1) % game.players.length;
+        if (!isPlayerActive(game.players[game.currentPlayerIdx])) advanceToNextPlayer(game);
+        game.lastEvent = `Round 1 — cards dealt! ${game.players[game.dealerIdx].name} is dealer.`;
       } else {
         startNewRound(game);
-        game.lastEvent = `Round ${game.round} — cards dealt!`;
+        game.lastEvent = `Round ${game.round} — ${game.players[game.dealerIdx].name} is dealer.`;
       }
 
       await env.FLIP7.put(game.roomCode, JSON.stringify(game), { expirationTtl: 86400 });
       return json(filterForPlayer(game, body.playerId));
     }
 
-    // HIT — draw a card
+    // HIT
     if (method === 'POST' && pathname === '/api/hit') {
       const body = await request.json() as { gameId: string; playerId: string };
       const data = await env.FLIP7.get(body.gameId.toUpperCase());
@@ -415,7 +546,6 @@ export default {
       const player = game.players[game.currentPlayerIdx];
       if (player.id !== body.playerId) return json({ error: 'Not your turn' }, 400);
       if (player.pendingAction) return json({ error: 'Resolve your action card first' }, 400);
-      if (player.pendingFlip3 > 0) return json({ error: 'Still flipping cards from Flip Three' }, 400);
 
       const card = drawCard(game);
       if (!card) return json({ error: 'Deck empty' }, 400);
@@ -423,21 +553,21 @@ export default {
       const event = dealCardToPlayer(game, player, card);
       game.lastEvent = event;
 
-      // If player has a pending action to resolve, don't advance yet
-      if (player.pendingAction) {
-        // Wait for target selection
+      // Don't advance if: pending action, or round already ended (Flip 7)
+      if (game.phase !== 'playing') {
+        // Round ended (Flip 7 or all busted)
+      } else if (player.pendingAction) {
+        // Wait for action target
       } else if (player.busted) {
         advanceToNextPlayer(game);
-      } else {
-        // Check if it was a flip3 that just got added
-        // Normal card — turn stays if not busted, player decides hit/stay
       }
+      // Otherwise player can hit or stay again
 
       await env.FLIP7.put(game.roomCode, JSON.stringify(game), { expirationTtl: 86400 });
       return json(filterForPlayer(game, body.playerId));
     }
 
-    // STAY — bank points
+    // STAY
     if (method === 'POST' && pathname === '/api/stay') {
       const body = await request.json() as { gameId: string; playerId: string };
       const data = await env.FLIP7.get(body.gameId.toUpperCase());
@@ -450,7 +580,8 @@ export default {
       if (player.id !== body.playerId) return json({ error: 'Not your turn' }, 400);
 
       player.stayed = true;
-      game.lastEvent = `${player.name} stayed with ${calcRoundScore(player)} points`;
+      const score = calcRoundScore(player);
+      game.lastEvent = `${player.name} stayed with ${score} points ✋`;
 
       advanceToNextPlayer(game);
 
@@ -458,7 +589,7 @@ export default {
       return json(filterForPlayer(game, body.playerId));
     }
 
-    // Resolve action card (choose target)
+    // Resolve action (choose target by ID or name)
     if (method === 'POST' && pathname === '/api/action') {
       const body = await request.json() as { gameId: string; playerId: string; targetId: string };
       const data = await env.FLIP7.get(body.gameId.toUpperCase());
@@ -470,53 +601,48 @@ export default {
       const player = game.players.find(p => p.id === body.playerId);
       if (!player || !player.pendingAction) return json({ error: 'No pending action' }, 400);
 
-      const target = game.players.find(p => p.id === body.targetId);
-      if (!target || target.busted || target.stayed) return json({ error: 'Invalid target' }, 400);
+      // Accept target by ID or by name (since IDs are stripped from non-self players)
+      const target = game.players.find(p => p.id === body.targetId) ||
+                     game.players.find(p => p.name === body.targetId);
+      if (!target) return json({ error: 'Invalid target' }, 400);
+
+      // Freeze can target any active player; Flip Three too
+      if (target.busted || target.stayed || target.frozen) {
+        return json({ error: 'Target is not active' }, 400);
+      }
 
       const action = player.pendingAction;
       player.pendingAction = null;
 
       if (action.action === 'freeze') {
-        // Freeze cannot be blocked by Second Chance
         target.frozen = true;
-        target.stayed = true; // frozen = banked
-        game.lastEvent = `${player.name} froze ${target.name}! (banked ${calcRoundScore(target)} pts)`;
+        target.stayed = true;
+        const score = calcRoundScore(target);
+        game.lastEvent = `❄️ ${player.name} froze ${target.name}! (banked ${score} pts)`;
       } else if (action.action === 'flip3') {
-        target.pendingFlip3 = 3;
-        game.lastEvent = `${player.name} used Flip Three on ${target.name}!`;
+        game.lastEvent = `🃏 ${player.name} used Flip Three on ${target.name}!`;
 
-        // If target is not the current player, we need to resolve immediately
-        // Auto-flip the 3 cards for the target
-        const events: string[] = [];
-        while (target.pendingFlip3 > 0 && !target.busted) {
-          const c = drawCard(game);
-          if (!c) break;
-          target.pendingFlip3--;
-          const ev = dealCardToPlayer(game, target, c);
-          if (ev) events.push(ev);
-          // If they got another action card, it needs to be resolved
-          if (target.pendingAction) {
-            // Auto-play on self if only player left, otherwise hold
-            break;
+        const events = resolveFlipThree(game, target);
+        if (events.length > 0) {
+          game.lastEvent += ' → ' + events.join(' → ');
+        }
+      }
+
+      // Advance turn if current player resolved their action and is done
+      if (game.phase === 'playing') {
+        const curPlayer = game.players[game.currentPlayerIdx];
+        if (curPlayer.id === body.playerId && !curPlayer.pendingAction) {
+          if (curPlayer.busted || curPlayer.stayed || curPlayer.frozen) {
+            advanceToNextPlayer(game);
           }
         }
-        target.pendingFlip3 = 0;
-        if (events.length > 0) {
-          game.lastEvent = events.join(' → ');
-        }
-      }
 
-      // If current player resolved their action, advance turn
-      if (game.players[game.currentPlayerIdx].id === body.playerId && !player.pendingAction) {
-        if (player.busted || player.stayed || player.frozen) {
-          advanceToNextPlayer(game);
-        }
-        // Otherwise player can still hit/stay
-      }
+        // Check if any player with pending action needs to resolve (from Flip Three chain)
+        // If the target got a pending action from Flip Three, they resolve it on their next turn
 
-      // Check if round is over
-      if (!game.players.some(isPlayerActive) && game.phase === 'playing') {
-        endRound(game);
+        if (!game.players.some(isPlayerActive) && game.phase === 'playing') {
+          endRound(game);
+        }
       }
 
       await env.FLIP7.put(game.roomCode, JSON.stringify(game), { expirationTtl: 86400 });
@@ -533,7 +659,7 @@ export default {
       if (game.phase !== 'round-end') return json({ error: 'Not at round end' }, 400);
 
       startNewRound(game);
-      game.lastEvent = `Round ${game.round} — cards dealt!`;
+      game.lastEvent = `Round ${game.round} — ${game.players[game.dealerIdx].name} is dealer.`;
 
       await env.FLIP7.put(game.roomCode, JSON.stringify(game), { expirationTtl: 86400 });
       return json(filterForPlayer(game, body.playerId));
@@ -548,11 +674,7 @@ export default {
       const old: GameState = JSON.parse(data);
       const game = createGame();
       game.roomCode = old.roomCode;
-      game.players = old.players.map(p => ({
-        id: p.id, name: p.name, cards: [], totalScore: 0, roundScore: 0,
-        busted: false, stayed: false, frozen: false,
-        hasSecondChance: false, pendingFlip3: 0, pendingAction: null,
-      }));
+      game.players = old.players.map(p => newPlayer(p.id, p.name));
       game.phase = 'lobby';
 
       await env.FLIP7.put(game.roomCode, JSON.stringify(game), { expirationTtl: 86400 });
