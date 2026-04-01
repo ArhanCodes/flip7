@@ -1,7 +1,7 @@
 import { getHTML } from './html';
 
 export interface Env {
-  FLIP7: KVNamespace;
+  GAME_ROOM: DurableObjectNamespace;
 }
 
 // ============================================================
@@ -438,247 +438,258 @@ function newPlayer(id: string, name: string): PlayerState {
   };
 }
 
+// ============================================================
+// Durable Object — one instance per game room
+// ============================================================
+
+export class Flip7Room {
+  private state: DurableObjectState;
+  private game: GameState | null = null;
+
+  constructor(state: DurableObjectState) { this.state = state; }
+
+  private async load(): Promise<GameState | null> {
+    if (this.game) return this.game;
+    this.game = (await this.state.storage.get<GameState>('game')) ?? null;
+    return this.game;
+  }
+  private async save(): Promise<void> {
+    if (this.game) await this.state.storage.put('game', this.game);
+  }
+
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    const action = url.searchParams.get('action');
+    if (request.method === 'OPTIONS') {
+      return new Response(null, { headers: { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': '*', 'Access-Control-Allow-Headers': '*' } });
+    }
+    try {
+      switch (action) {
+        case 'create': return await this.doCreate(request);
+        case 'state': return await this.doState(request);
+        case 'join': return await this.doJoin(request);
+        case 'start': return await this.doStart(request);
+        case 'hit': return await this.doHit(request);
+        case 'stay': return await this.doStay(request);
+        case 'action': return await this.doAction(request);
+        case 'next-round': return await this.doNextRound(request);
+        case 'new-game': return await this.doNewGame(request);
+        default: return json({ error: 'Unknown action' }, 400);
+      }
+    } catch (e: any) { return json({ error: e.message || 'Internal error' }, 500); }
+  }
+
+  private async doCreate(request: Request): Promise<Response> {
+    const body = await request.json() as { roomCode: string };
+    const g = createGame();
+    g.roomCode = body.roomCode;
+    this.game = g;
+    await this.save();
+    return json({ roomCode: g.roomCode });
+  }
+
+  private async doState(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    const pid = url.searchParams.get('playerId');
+    const game = await this.load();
+    if (!game) return json({ error: 'Game not found' }, 404);
+    return json(filterForPlayer(game, pid));
+  }
+
+  private async doJoin(request: Request): Promise<Response> {
+    const body = await request.json() as { name: string };
+    const game = await this.load();
+    if (!game) return json({ error: 'Game not found' }, 404);
+    if (game.phase !== 'lobby') return json({ error: 'Game already started' }, 400);
+    if (game.players.length >= 8) return json({ error: 'Room full (max 8)' }, 400);
+    const name = body.name.trim();
+    if (!name) return json({ error: 'Enter a name' }, 400);
+    const existing = game.players.find(p => p.name.toLowerCase() === name.toLowerCase());
+    if (existing) {
+      return json({ playerId: existing.id, game: filterForPlayer(game, existing.id) });
+    }
+    const pid = generateId();
+    game.players.push(newPlayer(pid, name));
+    await this.save();
+    return json({ playerId: pid, game: filterForPlayer(game, pid) });
+  }
+
+  private async doStart(request: Request): Promise<Response> {
+    const body = await request.json() as { playerId: string };
+    const game = await this.load();
+    if (!game) return json({ error: 'Game not found' }, 404);
+    if (game.phase !== 'lobby' && game.phase !== 'round-end') return json({ error: 'Cannot start now' }, 400);
+    if (game.players.length < 2) return json({ error: 'Need at least 2 players' }, 400);
+
+    if (game.phase === 'lobby') {
+      game.deck = shuffle(buildDeck());
+      game.discardPile = [];
+      game.phase = 'playing';
+      game.round = 1;
+      game.dealerIdx = 0;
+      for (let i = 0; i < game.players.length; i++) {
+        const idx = (game.dealerIdx + 1 + i) % game.players.length;
+        const card = drawCard(game);
+        if (card) dealCardToPlayer(game, game.players[idx], card);
+      }
+      game.currentPlayerIdx = (game.dealerIdx + 1) % game.players.length;
+      if (!isPlayerActive(game.players[game.currentPlayerIdx])) advanceToNextPlayer(game);
+      game.lastEvent = `Round 1 — cards dealt! ${game.players[game.dealerIdx].name} is dealer.`;
+    } else {
+      startNewRound(game);
+      game.lastEvent = `Round ${game.round} — ${game.players[game.dealerIdx].name} is dealer.`;
+    }
+    await this.save();
+    return json(filterForPlayer(game, body.playerId));
+  }
+
+  private async doHit(request: Request): Promise<Response> {
+    const body = await request.json() as { playerId: string };
+    const game = await this.load();
+    if (!game) return json({ error: 'Game not found' }, 404);
+    if (game.phase !== 'playing') return json({ error: 'Not playing' }, 400);
+    const player = game.players[game.currentPlayerIdx];
+    if (player.id !== body.playerId) return json({ error: 'Not your turn' }, 400);
+    if (player.pendingAction) return json({ error: 'Resolve your action card first' }, 400);
+    const card = drawCard(game);
+    if (!card) return json({ error: 'Deck empty' }, 400);
+    game.lastEvent = dealCardToPlayer(game, player, card);
+    if (game.phase !== 'playing') { /* round ended */ }
+    else if (player.pendingAction) { /* wait for action target */ }
+    else { advanceToNextPlayer(game); }
+    await this.save();
+    return json(filterForPlayer(game, body.playerId));
+  }
+
+  private async doStay(request: Request): Promise<Response> {
+    const body = await request.json() as { playerId: string };
+    const game = await this.load();
+    if (!game) return json({ error: 'Game not found' }, 404);
+    if (game.phase !== 'playing') return json({ error: 'Not playing' }, 400);
+    const player = game.players[game.currentPlayerIdx];
+    if (player.id !== body.playerId) return json({ error: 'Not your turn' }, 400);
+    player.stayed = true;
+    game.lastEvent = `${player.name} stayed with ${calcRoundScore(player)} points ✋`;
+    advanceToNextPlayer(game);
+    await this.save();
+    return json(filterForPlayer(game, body.playerId));
+  }
+
+  private async doAction(request: Request): Promise<Response> {
+    const body = await request.json() as { playerId: string; targetId: string };
+    const game = await this.load();
+    if (!game) return json({ error: 'Game not found' }, 404);
+    if (game.phase !== 'playing') return json({ error: 'Not playing' }, 400);
+    const player = game.players.find(p => p.id === body.playerId);
+    if (!player || !player.pendingAction) return json({ error: 'No pending action' }, 400);
+    const target = game.players.find(p => p.id === body.targetId) ||
+                   game.players.find(p => p.name === body.targetId);
+    if (!target) return json({ error: 'Invalid target' }, 400);
+    if (target.busted || target.stayed || target.frozen) return json({ error: 'Target not active' }, 400);
+
+    const action = player.pendingAction;
+    player.pendingAction = null;
+
+    if (action.action === 'freeze') {
+      target.frozen = true;
+      target.stayed = true;
+      game.lastEvent = `❄️ ${player.name} froze ${target.name}! (banked ${calcRoundScore(target)} pts)`;
+    } else if (action.action === 'flip3') {
+      game.lastEvent = `🃏 ${player.name} used Flip Three on ${target.name}!`;
+      const events = resolveFlipThree(game, target);
+      if (events.length > 0) game.lastEvent += ' → ' + events.join(' → ');
+    }
+
+    if (game.phase === 'playing') {
+      const cur = game.players[game.currentPlayerIdx];
+      if (cur.id === body.playerId && !cur.pendingAction) {
+        // After resolving action, advance (1 card per turn rule)
+        advanceToNextPlayer(game);
+      }
+      if (!game.players.some(isPlayerActive) && game.phase === 'playing') endRound(game);
+    }
+    await this.save();
+    return json(filterForPlayer(game, body.playerId));
+  }
+
+  private async doNextRound(request: Request): Promise<Response> {
+    const body = await request.json() as { playerId: string };
+    const game = await this.load();
+    if (!game) return json({ error: 'Game not found' }, 404);
+    if (game.phase !== 'round-end') return json({ error: 'Not at round end' }, 400);
+    startNewRound(game);
+    game.lastEvent = `Round ${game.round} — ${game.players[game.dealerIdx].name} is dealer.`;
+    await this.save();
+    return json(filterForPlayer(game, body.playerId));
+  }
+
+  private async doNewGame(request: Request): Promise<Response> {
+    const body = await request.json() as { playerId: string };
+    const game = await this.load();
+    if (!game) return json({ error: 'Game not found' }, 404);
+    const g = createGame();
+    g.roomCode = game.roomCode;
+    g.players = game.players.map(p => newPlayer(p.id, p.name));
+    g.phase = 'lobby';
+    this.game = g;
+    await this.save();
+    return json(filterForPlayer(g, body.playerId));
+  }
+}
+
+// ============================================================
+// Worker entry — routes to Durable Object
+// ============================================================
+
+function getStub(env: Env, roomCode: string): DurableObjectStub {
+  const id = env.GAME_ROOM.idFromName(roomCode.toUpperCase());
+  return env.GAME_ROOM.get(id);
+}
+
+function fwd(env: Env, code: string, action: string, request: Request, body?: any): Promise<Response> {
+  const stub = getStub(env, code);
+  const qs = action.includes('?') ? action : `?action=${action}`;
+  return stub.fetch(new Request(`https://do/${qs}`, {
+    method: body ? 'POST' : 'GET',
+    headers: body ? { 'Content-Type': 'application/json' } : {},
+    body: body ? JSON.stringify(body) : undefined,
+  }));
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     const { pathname } = url;
-    const method = request.method;
-
-    if (method === 'OPTIONS') {
-      return new Response(null, {
-        headers: { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': '*', 'Access-Control-Allow-Headers': '*' },
-      });
+    if (request.method === 'OPTIONS') {
+      return new Response(null, { headers: { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': '*', 'Access-Control-Allow-Headers': '*' } });
     }
-
-    if (method === 'GET' && pathname === '/') {
+    if (request.method === 'GET' && pathname === '/') {
       return new Response(getHTML(), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
     }
 
-    // Create game
-    if (method === 'POST' && pathname === '/api/create') {
-      const game = createGame();
-      await env.FLIP7.put(game.roomCode, JSON.stringify(game), { expirationTtl: 86400 });
-      return json({ roomCode: game.roomCode });
+    if (request.method === 'POST' && pathname === '/api/create') {
+      const roomCode = generateCode();
+      return fwd(env, roomCode, 'create', request, { roomCode });
     }
 
-    // Get state
     const gameMatch = pathname.match(/^\/api\/game\/([A-Za-z0-9]{4})$/);
-    if (method === 'GET' && gameMatch) {
+    if (request.method === 'GET' && gameMatch) {
       const code = gameMatch[1].toUpperCase();
-      const pid = url.searchParams.get('playerId');
-      const data = await env.FLIP7.get(code);
-      if (!data) return json({ error: 'Game not found' }, 404);
-      return json(filterForPlayer(JSON.parse(data), pid));
+      const pid = url.searchParams.get('playerId') || '';
+      return fwd(env, code, `?action=state&playerId=${pid}`, request);
     }
 
-    // Join
-    if (method === 'POST' && pathname === '/api/join') {
-      const body = await request.json() as { gameId: string; name: string };
-      const code = body.gameId.toUpperCase();
-      const data = await env.FLIP7.get(code);
-      if (!data) return json({ error: 'Game not found' }, 404);
-
-      const game: GameState = JSON.parse(data);
-      if (game.phase !== 'lobby') return json({ error: 'Game already started' }, 400);
-      if (game.players.length >= 8) return json({ error: 'Room full (max 8)' }, 400);
-
-      const name = body.name.trim();
-      if (!name) return json({ error: 'Enter a name' }, 400);
-
-      // Rejoin if same name
-      const existing = game.players.find(p => p.name.toLowerCase() === name.toLowerCase());
-      if (existing) {
-        return json({ playerId: existing.id, game: filterForPlayer(game, existing.id) });
-      }
-
-      const pid = generateId();
-      game.players.push(newPlayer(pid, name));
-
-      await env.FLIP7.put(game.roomCode, JSON.stringify(game), { expirationTtl: 86400 });
-      return json({ playerId: pid, game: filterForPlayer(game, pid) });
-    }
-
-    // Start game
-    if (method === 'POST' && pathname === '/api/start') {
-      const body = await request.json() as { gameId: string; playerId: string };
-      const data = await env.FLIP7.get(body.gameId.toUpperCase());
-      if (!data) return json({ error: 'Game not found' }, 404);
-
-      const game: GameState = JSON.parse(data);
-      if (game.phase !== 'lobby' && game.phase !== 'round-end') return json({ error: 'Cannot start now' }, 400);
-      if (game.players.length < 2) return json({ error: 'Need at least 2 players' }, 400);
-
-      if (game.phase === 'lobby') {
-        game.deck = shuffle(buildDeck());
-        game.discardPile = [];
-        game.phase = 'playing';
-        game.round = 1;
-        game.dealerIdx = 0;
-
-        // Deal one card to each player
-        for (let i = 0; i < game.players.length; i++) {
-          const idx = (game.dealerIdx + 1 + i) % game.players.length;
-          const card = drawCard(game);
-          if (card) dealCardToPlayer(game, game.players[idx], card);
-        }
-
-        game.currentPlayerIdx = (game.dealerIdx + 1) % game.players.length;
-        if (!isPlayerActive(game.players[game.currentPlayerIdx])) advanceToNextPlayer(game);
-        game.lastEvent = `Round 1 — cards dealt! ${game.players[game.dealerIdx].name} is dealer.`;
-      } else {
-        startNewRound(game);
-        game.lastEvent = `Round ${game.round} — ${game.players[game.dealerIdx].name} is dealer.`;
-      }
-
-      await env.FLIP7.put(game.roomCode, JSON.stringify(game), { expirationTtl: 86400 });
-      return json(filterForPlayer(game, body.playerId));
-    }
-
-    // HIT
-    if (method === 'POST' && pathname === '/api/hit') {
-      const body = await request.json() as { gameId: string; playerId: string };
-      const data = await env.FLIP7.get(body.gameId.toUpperCase());
-      if (!data) return json({ error: 'Game not found' }, 404);
-
-      const game: GameState = JSON.parse(data);
-      if (game.phase !== 'playing') return json({ error: 'Not playing' }, 400);
-
-      const player = game.players[game.currentPlayerIdx];
-      if (player.id !== body.playerId) return json({ error: 'Not your turn' }, 400);
-      if (player.pendingAction) return json({ error: 'Resolve your action card first' }, 400);
-
-      const card = drawCard(game);
-      if (!card) return json({ error: 'Deck empty' }, 400);
-
-      const event = dealCardToPlayer(game, player, card);
-      game.lastEvent = event;
-
-      // Don't advance if: pending action, or round already ended (Flip 7)
-      if (game.phase !== 'playing') {
-        // Round ended (Flip 7 or all busted)
-      } else if (player.pendingAction) {
-        // Wait for action target
-      } else if (player.busted) {
-        advanceToNextPlayer(game);
-      }
-      // Otherwise player can hit or stay again
-
-      await env.FLIP7.put(game.roomCode, JSON.stringify(game), { expirationTtl: 86400 });
-      return json(filterForPlayer(game, body.playerId));
-    }
-
-    // STAY
-    if (method === 'POST' && pathname === '/api/stay') {
-      const body = await request.json() as { gameId: string; playerId: string };
-      const data = await env.FLIP7.get(body.gameId.toUpperCase());
-      if (!data) return json({ error: 'Game not found' }, 404);
-
-      const game: GameState = JSON.parse(data);
-      if (game.phase !== 'playing') return json({ error: 'Not playing' }, 400);
-
-      const player = game.players[game.currentPlayerIdx];
-      if (player.id !== body.playerId) return json({ error: 'Not your turn' }, 400);
-
-      player.stayed = true;
-      const score = calcRoundScore(player);
-      game.lastEvent = `${player.name} stayed with ${score} points ✋`;
-
-      advanceToNextPlayer(game);
-
-      await env.FLIP7.put(game.roomCode, JSON.stringify(game), { expirationTtl: 86400 });
-      return json(filterForPlayer(game, body.playerId));
-    }
-
-    // Resolve action (choose target by ID or name)
-    if (method === 'POST' && pathname === '/api/action') {
-      const body = await request.json() as { gameId: string; playerId: string; targetId: string };
-      const data = await env.FLIP7.get(body.gameId.toUpperCase());
-      if (!data) return json({ error: 'Game not found' }, 404);
-
-      const game: GameState = JSON.parse(data);
-      if (game.phase !== 'playing') return json({ error: 'Not playing' }, 400);
-
-      const player = game.players.find(p => p.id === body.playerId);
-      if (!player || !player.pendingAction) return json({ error: 'No pending action' }, 400);
-
-      // Accept target by ID or by name (since IDs are stripped from non-self players)
-      const target = game.players.find(p => p.id === body.targetId) ||
-                     game.players.find(p => p.name === body.targetId);
-      if (!target) return json({ error: 'Invalid target' }, 400);
-
-      // Freeze can target any active player; Flip Three too
-      if (target.busted || target.stayed || target.frozen) {
-        return json({ error: 'Target is not active' }, 400);
-      }
-
-      const action = player.pendingAction;
-      player.pendingAction = null;
-
-      if (action.action === 'freeze') {
-        target.frozen = true;
-        target.stayed = true;
-        const score = calcRoundScore(target);
-        game.lastEvent = `❄️ ${player.name} froze ${target.name}! (banked ${score} pts)`;
-      } else if (action.action === 'flip3') {
-        game.lastEvent = `🃏 ${player.name} used Flip Three on ${target.name}!`;
-
-        const events = resolveFlipThree(game, target);
-        if (events.length > 0) {
-          game.lastEvent += ' → ' + events.join(' → ');
-        }
-      }
-
-      // Advance turn if current player resolved their action and is done
-      if (game.phase === 'playing') {
-        const curPlayer = game.players[game.currentPlayerIdx];
-        if (curPlayer.id === body.playerId && !curPlayer.pendingAction) {
-          if (curPlayer.busted || curPlayer.stayed || curPlayer.frozen) {
-            advanceToNextPlayer(game);
-          }
-        }
-
-        // Check if any player with pending action needs to resolve (from Flip Three chain)
-        // If the target got a pending action from Flip Three, they resolve it on their next turn
-
-        if (!game.players.some(isPlayerActive) && game.phase === 'playing') {
-          endRound(game);
-        }
-      }
-
-      await env.FLIP7.put(game.roomCode, JSON.stringify(game), { expirationTtl: 86400 });
-      return json(filterForPlayer(game, body.playerId));
-    }
-
-    // Next round
-    if (method === 'POST' && pathname === '/api/next-round') {
-      const body = await request.json() as { gameId: string; playerId: string };
-      const data = await env.FLIP7.get(body.gameId.toUpperCase());
-      if (!data) return json({ error: 'Game not found' }, 404);
-
-      const game: GameState = JSON.parse(data);
-      if (game.phase !== 'round-end') return json({ error: 'Not at round end' }, 400);
-
-      startNewRound(game);
-      game.lastEvent = `Round ${game.round} — ${game.players[game.dealerIdx].name} is dealer.`;
-
-      await env.FLIP7.put(game.roomCode, JSON.stringify(game), { expirationTtl: 86400 });
-      return json(filterForPlayer(game, body.playerId));
-    }
-
-    // New game
-    if (method === 'POST' && pathname === '/api/new-game') {
-      const body = await request.json() as { gameId: string; playerId: string };
-      const data = await env.FLIP7.get(body.gameId.toUpperCase());
-      if (!data) return json({ error: 'Game not found' }, 404);
-
-      const old: GameState = JSON.parse(data);
-      const game = createGame();
-      game.roomCode = old.roomCode;
-      game.players = old.players.map(p => newPlayer(p.id, p.name));
-      game.phase = 'lobby';
-
-      await env.FLIP7.put(game.roomCode, JSON.stringify(game), { expirationTtl: 86400 });
-      return json(filterForPlayer(game, body.playerId));
+    // All POST actions: extract gameId, forward body
+    const postActions: Record<string, string> = {
+      '/api/join': 'join', '/api/start': 'start', '/api/hit': 'hit',
+      '/api/stay': 'stay', '/api/action': 'action',
+      '/api/next-round': 'next-round', '/api/new-game': 'new-game',
+    };
+    if (request.method === 'POST' && postActions[pathname]) {
+      const body = await request.json() as any;
+      const code = (body.gameId || '').toUpperCase();
+      if (!code) return json({ error: 'Missing gameId' }, 400);
+      return fwd(env, code, postActions[pathname], request, body);
     }
 
     return json({ error: 'Not found' }, 404);
