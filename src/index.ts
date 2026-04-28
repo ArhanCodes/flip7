@@ -799,21 +799,18 @@ export class Flip7Stats {
 
 function renderWinsPage(wins: WinEntry[]): string {
   // Aggregate by name
-  const tally: Record<string, { wins: number; rooms: Set<string>; latest: number }> = {};
+  const tally: Record<string, { wins: number; latest: number }> = {};
   for (const w of wins) {
     const k = w.winnerName;
-    if (!tally[k]) tally[k] = { wins: 0, rooms: new Set(), latest: 0 };
+    if (!tally[k]) tally[k] = { wins: 0, latest: 0 };
     tally[k].wins++;
-    if (w.roomCode) tally[k].rooms.add(w.roomCode);
     if (w.finishedAt > tally[k].latest) tally[k].latest = w.finishedAt;
   }
   const rows = Object.entries(tally)
-    .map(([name, t]) => ({ name, wins: t.wins, rooms: t.rooms.size, latest: t.latest }))
+    .map(([name, t]) => ({ name, wins: t.wins, latest: t.latest }))
     .sort((a, b) => b.wins - a.wins || b.latest - a.latest);
 
   const esc = (s: string) => s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]!));
-  const recent = wins.slice(-15).reverse();
-  const fmt = (t: number) => new Date(t).toLocaleString('en', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
 
   return `<!DOCTYPE html>
 <html lang="en"><head>
@@ -845,12 +842,9 @@ h1{font-size:1.6rem;font-weight:800;letter-spacing:0.04em;background:linear-grad
 ${rows.length === 0 ? '<div class="empty">No wins recorded yet. Finish a game and it&apos;ll show up here.</div>' :
   rows.map((r, i) => {
     const rankClass = i === 0 ? 'gold' : i === 1 ? 'silver' : i === 2 ? 'bronze' : '';
-    return `<div class="row"><span class="rank ${rankClass}">${i+1}</span><div><div class="name">${esc(r.name)}</div><div class="meta">${r.rooms} room${r.rooms===1?'':'s'} · last win ${fmt(r.latest)}</div></div><span class="wins-pill">${r.wins} win${r.wins===1?'':'s'}</span></div>`;
+    return `<div class="row"><span class="rank ${rankClass}">${i+1}</span><div class="name">${esc(r.name)}</div><span class="wins-pill">${r.wins} win${r.wins===1?'':'s'}</span></div>`;
   }).join('')}
 </div>
-${recent.length > 0 ? `<div class="card recent"><h2>Recent Wins</h2>
-${recent.map(w => `<div class="row"><div><strong>${esc(w.winnerName)}</strong> won room ${esc(w.roomCode || '?')}${w.finalScore ? ` · ${w.finalScore} pts` : ''}</div><span class="when">${fmt(w.finishedAt)}</span></div>`).join('')}
-</div>` : ''}
 </div></body></html>`;
 }
 
