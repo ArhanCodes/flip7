@@ -4,9 +4,14 @@ compatibility_date = "2024-01-01"
 
 [durable_objects]
 bindings = [
-  { name = "GAME_ROOM", class_name = "Flip7Room" }
+  { name = "GAME_ROOM", class_name = "Flip7Room" },
+  { name = "STATS", class_name = "Flip7Stats" }
 ]
 
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["Flip7Room"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["Flip7Stats"]

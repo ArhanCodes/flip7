@@ -2,12 +2,13 @@ import { getHTML } from './html';
 
 export interface Env {
   GAME_ROOM: DurableObjectNamespace;
+  STATS: DurableObjectNamespace;
 }
 
 // ============================================================
 // DECK — Official Flip 7 composition (94 cards)
 // Number: 0×1, 1×1, 2×2, 3×3, 4×4, 5×5, 6×6, 7×7, 8×8, 9×9, 10×10, 11×11, 12×12
-// Modifier: +2, +4, +6, +8, +8, +10, x2 (7 total)
+// Modifier: +2, +4, +6, +8, +10, x2 (6 total)
 // Action: Freeze×3, Flip Three×3, Second Chance×3 (9 total)
 // ============================================================
 
@@ -82,6 +83,7 @@ interface GameState {
   lastEvent: string | null;
   winner: string | null;
   chat: ChatMessage[];
+  winRecorded?: boolean;
 }
 
 const CHAT_MAX = 100;
@@ -464,9 +466,29 @@ function newPlayer(id: string, name: string): PlayerState {
 
 export class Flip7Room {
   private state: DurableObjectState;
+  private env: Env;
   private game: GameState | null = null;
 
-  constructor(state: DurableObjectState) { this.state = state; }
+  constructor(state: DurableObjectState, env: Env) { this.state = state; this.env = env; }
+
+  private async recordWin(winnerName: string, players: { name: string; totalScore: number }[]): Promise<void> {
+    if (!this.env?.STATS) return;
+    try {
+      const stub = this.env.STATS.get(this.env.STATS.idFromName('global'));
+      await stub.fetch('https://stats/record', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          winnerName,
+          roomCode: this.game?.roomCode,
+          players,
+          finishedAt: Date.now(),
+        }),
+      });
+    } catch (e) {
+      console.error('recordWin failed:', e);
+    }
+  }
 
   private async load(): Promise<GameState | null> {
     if (this.game) return this.game;
@@ -476,7 +498,16 @@ export class Flip7Room {
     return this.game;
   }
   private async save(): Promise<void> {
-    if (this.game) await this.state.storage.put('game', this.game);
+    if (!this.game) return;
+    // Record win exactly once when phase first reaches game-over
+    if (this.game.phase === 'game-over' && this.game.winner && !this.game.winRecorded) {
+      this.game.winRecorded = true;
+      await this.recordWin(
+        this.game.winner,
+        this.game.players.map(p => ({ name: p.name, totalScore: p.totalScore })),
+      );
+    }
+    await this.state.storage.put('game', this.game);
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -703,6 +734,108 @@ function fwd(env: Env, code: string, action: string, request: Request, body?: an
   }));
 }
 
+// ============================================================
+// Stats DO — single instance ('global') tracking all wins
+// ============================================================
+
+interface WinEntry {
+  winnerName: string;
+  roomCode: string;
+  finalScore?: number;
+  players: { name: string; totalScore: number }[];
+  finishedAt: number;
+}
+
+export class Flip7Stats {
+  private state: DurableObjectState;
+  constructor(state: DurableObjectState) { this.state = state; }
+
+  private async loadWins(): Promise<WinEntry[]> {
+    return (await this.state.storage.get<WinEntry[]>('wins')) ?? [];
+  }
+
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    if (url.pathname === '/record' && request.method === 'POST') {
+      const body = await request.json() as WinEntry;
+      const wins = await this.loadWins();
+      wins.push({
+        winnerName: body.winnerName,
+        roomCode: body.roomCode,
+        players: body.players || [],
+        finalScore: body.players?.find(p => p.name === body.winnerName)?.totalScore,
+        finishedAt: body.finishedAt || Date.now(),
+      });
+      // Keep last 1000 to bound storage
+      const trimmed = wins.slice(-1000);
+      await this.state.storage.put('wins', trimmed);
+      return json({ ok: true, count: trimmed.length });
+    }
+    if (url.pathname === '/list' && request.method === 'GET') {
+      const wins = await this.loadWins();
+      return json(wins);
+    }
+    return json({ error: 'Not found' }, 404);
+  }
+}
+
+function renderWinsPage(wins: WinEntry[]): string {
+  // Aggregate by name
+  const tally: Record<string, { wins: number; rooms: Set<string>; latest: number }> = {};
+  for (const w of wins) {
+    const k = w.winnerName;
+    if (!tally[k]) tally[k] = { wins: 0, rooms: new Set(), latest: 0 };
+    tally[k].wins++;
+    if (w.roomCode) tally[k].rooms.add(w.roomCode);
+    if (w.finishedAt > tally[k].latest) tally[k].latest = w.finishedAt;
+  }
+  const rows = Object.entries(tally)
+    .map(([name, t]) => ({ name, wins: t.wins, rooms: t.rooms.size, latest: t.latest }))
+    .sort((a, b) => b.wins - a.wins || b.latest - a.latest);
+
+  const esc = (s: string) => s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]!));
+  const recent = wins.slice(-15).reverse();
+  const fmt = (t: number) => new Date(t).toLocaleString('en', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+
+  return `<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>Flip 7 — Hall of Wins</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{background:#0b1220;color:#f1f5f9;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;padding:32px 16px;min-height:100vh}
+.wrap{max-width:560px;margin:0 auto;display:flex;flex-direction:column;gap:24px}
+h1{font-size:1.6rem;font-weight:800;letter-spacing:0.04em;background:linear-gradient(135deg,#facc15,#f97316);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+.sub{color:#94a3b8;font-size:.85rem;margin-top:4px}
+.card{background:#1e293b;border:1px solid #334155;border-radius:14px;overflow:hidden}
+.card h2{font-size:.7rem;text-transform:uppercase;letter-spacing:.12em;color:#5eead4;padding:12px 16px;border-bottom:1px solid #334155;font-weight:800}
+.row{display:grid;grid-template-columns:32px 1fr auto;gap:12px;padding:12px 16px;border-bottom:1px solid #1e293b;align-items:center}
+.row:last-child{border-bottom:none}
+.rank{font-weight:800;color:#94a3b8;font-size:.9rem}
+.rank.gold{color:#facc15}.rank.silver{color:#cbd5e1}.rank.bronze{color:#f97316}
+.name{font-weight:700;font-size:1rem}
+.meta{color:#94a3b8;font-size:.75rem;margin-top:2px}
+.wins-pill{background:rgba(13,148,136,.15);color:#5eead4;padding:6px 12px;border-radius:999px;font-weight:800;font-size:.85rem}
+.recent .row{grid-template-columns:1fr auto;font-size:.85rem;padding:10px 16px}
+.recent .when{color:#64748b;font-size:.7rem}
+.empty{padding:24px 16px;text-align:center;color:#94a3b8;font-size:.9rem}
+</style></head>
+<body><div class="wrap">
+<header><h1>🏆 Hall of Wins</h1><p class="sub">All Flip 7 wins ever recorded · ${wins.length} total</p></header>
+<div class="card"><h2>Leaderboard</h2>
+${rows.length === 0 ? '<div class="empty">No wins recorded yet. Finish a game and it&apos;ll show up here.</div>' :
+  rows.map((r, i) => {
+    const rankClass = i === 0 ? 'gold' : i === 1 ? 'silver' : i === 2 ? 'bronze' : '';
+    return `<div class="row"><span class="rank ${rankClass}">${i+1}</span><div><div class="name">${esc(r.name)}</div><div class="meta">${r.rooms} room${r.rooms===1?'':'s'} · last win ${fmt(r.latest)}</div></div><span class="wins-pill">${r.wins} win${r.wins===1?'':'s'}</span></div>`;
+  }).join('')}
+</div>
+${recent.length > 0 ? `<div class="card recent"><h2>Recent Wins</h2>
+${recent.map(w => `<div class="row"><div><strong>${esc(w.winnerName)}</strong> won room ${esc(w.roomCode || '?')}${w.finalScore ? ` · ${w.finalScore} pts` : ''}</div><span class="when">${fmt(w.finishedAt)}</span></div>`).join('')}
+</div>` : ''}
+</div></body></html>`;
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -712,6 +845,22 @@ export default {
     }
     if (request.method === 'GET' && pathname === '/') {
       return new Response(getHTML(), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+    }
+
+    // Secret wins page
+    if (request.method === 'GET' && pathname === '/wins') {
+      const stub = env.STATS.get(env.STATS.idFromName('global'));
+      const res = await stub.fetch('https://stats/list');
+      const wins = await res.json() as WinEntry[];
+      return new Response(renderWinsPage(wins), {
+        headers: { 'Content-Type': 'text/html; charset=utf-8', 'X-Robots-Tag': 'noindex' },
+      });
+    }
+    if (request.method === 'GET' && pathname === '/api/stats') {
+      const stub = env.STATS.get(env.STATS.idFromName('global'));
+      const res = await stub.fetch('https://stats/list');
+      const wins = await res.json();
+      return json(wins);
     }
 
     if (request.method === 'POST' && pathname === '/api/create') {
