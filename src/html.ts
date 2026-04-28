@@ -40,6 +40,12 @@ export function getHTML(): string {
   /* Landing + Lobby shared */
   .box{max-width:420px;margin:20px auto;text-align:center;background:var(--card-bg);
     border:1px solid var(--border);border-radius:16px;padding:28px}
+  .rejoin-banner{background:rgba(34,197,94,.08);border:1px solid rgba(34,197,94,.3);
+    border-radius:12px;padding:14px 16px;margin-bottom:18px;text-align:left}
+  .rejoin-banner .rj-text{color:var(--text);font-size:.9rem;margin-bottom:10px;line-height:1.4}
+  .rejoin-banner .rj-text strong{color:var(--green-light);letter-spacing:.06em}
+  .rejoin-banner .rj-actions{display:flex;gap:8px;flex-wrap:wrap}
+  .rejoin-banner .btn{flex:1;min-width:120px;padding:10px 16px;font-size:.78rem}
   .box h2{font-size:1.15rem;margin-bottom:14px;letter-spacing:.03em}
   .row{display:flex;gap:8px;margin-bottom:10px}
   .row input,.row select{flex:1;background:var(--bg);border:2px solid var(--border);color:var(--text);
@@ -252,6 +258,13 @@ export function getHTML(): string {
   <!-- LANDING -->
   <div class="screen active" id="sLanding">
     <div class="box">
+      <div class="rejoin-banner" id="rejoinBanner" style="display:none">
+        <div class="rj-text">You have an unfinished game in room <strong id="rejoinCode"></strong>.</div>
+        <div class="rj-actions">
+          <button class="btn btn-green" onclick="rejoinSavedRoom()">Rejoin</button>
+          <button class="btn btn-sec" onclick="dismissSavedRoom()">Start Fresh</button>
+        </div>
+      </div>
       <h2>Play Flip 7</h2>
       <div class="row"><input type="text" id="joinCode" placeholder="Room code" maxlength="4">
         <button class="btn btn-teal" onclick="goLobby()">Join</button></div>
@@ -326,19 +339,63 @@ function saveSession(){
 }
 function clearSession(){localStorage.removeItem('f7_room');localStorage.removeItem('f7_pid')}
 
-// Auto-restore session
-(function(){
+// Check saved session — validate and show a "Rejoin / Start Fresh" prompt on the
+// landing screen instead of auto-jumping into the game. Closing the tab and
+// reopening always lands on the home screen.
+(function checkSavedSession(){
   const r=localStorage.getItem('f7_room'),p=localStorage.getItem('f7_pid');
-  if(r&&p){
-    roomCode=r;playerId=p;
-    fetch('/api/game/'+roomCode+'?playerId='+playerId).then(r=>r.json()).then(d=>{
-      if(d.error){clearSession();return}
-      const me=(d.players||[]).find(pl=>pl.isMe);
-      if(!me){clearSession();return}
-      joined=true;lastJSON=JSON.stringify(d);renderState(d);startPoll();
-    }).catch(()=>clearSession());
-  }
+  if(!r||!p)return;
+  fetch('/api/game/'+r+'?playerId='+p).then(res=>res.json()).then(d=>{
+    if(d.error){clearSession();return}
+    const me=(d.players||[]).find(pl=>pl.isMe);
+    if(!me){clearSession();return}
+    if(d.phase==='game-over'){clearSession();return}
+    document.getElementById('rejoinCode').textContent=r;
+    document.getElementById('rejoinBanner').style.display='block';
+    const ji=document.getElementById('joinCode');
+    if(ji&&!ji.value)ji.value=r;
+  }).catch(()=>{/* offline — leave banner hidden */});
 })();
+
+function rejoinSavedRoom(){
+  const r=localStorage.getItem('f7_room'),p=localStorage.getItem('f7_pid');
+  if(!r||!p){document.getElementById('rejoinBanner').style.display='none';return}
+  roomCode=r;playerId=p;
+  fetch('/api/game/'+roomCode+'?playerId='+playerId).then(res=>res.json()).then(d=>{
+    if(d.error){clearSession();document.getElementById('rejoinBanner').style.display='none';return}
+    const me=(d.players||[]).find(pl=>pl.isMe);
+    if(!me){clearSession();document.getElementById('rejoinBanner').style.display='none';return}
+    if(d.phase==='game-over'){clearSession();document.getElementById('rejoinBanner').style.display='none';return}
+    joined=true;lastJSON=JSON.stringify(d);
+    document.getElementById('rejoinBanner').style.display='none';
+    if(d.phase==='lobby'){
+      show('sLobby');
+      document.getElementById('lobbyCode').textContent=roomCode;
+      document.getElementById('nameRow').style.display='none';
+      renderLobby(d);
+    } else {
+      renderState(d);
+    }
+    startPoll();
+  }).catch(()=>toast('Could not rejoin'));
+}
+
+function dismissSavedRoom(){
+  clearSession();
+  document.getElementById('rejoinBanner').style.display='none';
+  const ji=document.getElementById('joinCode');if(ji)ji.value='';
+}
+
+function newRoom(){
+  clearSession();
+  if(pollInterval){clearInterval(pollInterval);pollInterval=null}
+  roomCode=null;playerId=null;joined=false;lastJSON='';
+  document.getElementById('confettiContainer').innerHTML='';
+  document.getElementById('rejoinBanner').style.display='none';
+  const ji=document.getElementById('joinCode');if(ji)ji.value='';
+  const nameRow=document.getElementById('nameRow');if(nameRow)nameRow.style.display='';
+  show('sLanding');
+}
 
 function createGame(){
   fetch('/api/create',{method:'POST'}).then(r=>r.json()).then(d=>{
@@ -589,7 +646,10 @@ function renderGameOver(s){
   });
   table+='</tbody></table>';
   el.innerHTML+=table;
-  el.innerHTML+='<div style="margin-top:16px"><button class="btn btn-green btn-lg" onclick="newGame()">Play Again</button></div>';
+  el.innerHTML+='<div style="margin-top:16px;display:flex;gap:10px;justify-content:center;flex-wrap:wrap">'+
+    '<button class="btn btn-green btn-lg" onclick="newGame()">Keep Playing</button>'+
+    '<button class="btn btn-sec btn-lg" onclick="newRoom()">New Room</button>'+
+    '</div>';
   confetti();
 }
 
