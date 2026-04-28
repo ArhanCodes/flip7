@@ -30,7 +30,7 @@ function buildDeck(): Card[] {
       deck.push({ type: 'number', value: n });
     }
   }
-  const mods: ModifierKind[] = ['+2', '+4', '+6', '+8', '+8', '+10', 'x2'];
+  const mods: ModifierKind[] = ['+2', '+4', '+6', '+8', '+10', 'x2'];
   for (const m of mods) deck.push({ type: 'modifier', modifier: m });
   const actions: ActionKind[] = ['freeze', 'freeze', 'freeze', 'flip3', 'flip3', 'flip3', 'second-chance', 'second-chance', 'second-chance'];
   for (const a of actions) deck.push({ type: 'action', action: a });
