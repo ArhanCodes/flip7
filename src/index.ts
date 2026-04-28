@@ -751,7 +751,25 @@ export class Flip7Stats {
   constructor(state: DurableObjectState) { this.state = state; }
 
   private async loadWins(): Promise<WinEntry[]> {
-    return (await this.state.storage.get<WinEntry[]>('wins')) ?? [];
+    // One-time backfill of remembered wins (Aryan x2, AJ x1) the first
+    // time this DO is read. Self-locking via the 'seeded:v1' flag so
+    // it never runs again.
+    const seeded = await this.state.storage.get<boolean>('seeded:v1');
+    const existing = (await this.state.storage.get<WinEntry[]>('wins')) ?? [];
+    if (!seeded) {
+      const now = Date.now();
+      const day = 86400000;
+      const backfill: WinEntry[] = [
+        { winnerName: 'AJ', roomCode: '—', players: [], finishedAt: now - 3 * day },
+        { winnerName: 'Aryan', roomCode: '—', players: [], finishedAt: now - 2 * day },
+        { winnerName: 'Aryan', roomCode: '—', players: [], finishedAt: now - day },
+      ];
+      const merged = [...backfill, ...existing];
+      await this.state.storage.put('wins', merged);
+      await this.state.storage.put('seeded:v1', true);
+      return merged;
+    }
+    return existing;
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -801,7 +819,7 @@ function renderWinsPage(wins: WinEntry[]): string {
 <html lang="en"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="robots" content="noindex,nofollow">
-<title>Flip 7 — Hall of Wins</title>
+<title>Flip 7 — Wins</title>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 body{background:#0b1220;color:#f1f5f9;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;padding:32px 16px;min-height:100vh}
@@ -822,7 +840,7 @@ h1{font-size:1.6rem;font-weight:800;letter-spacing:0.04em;background:linear-grad
 .empty{padding:24px 16px;text-align:center;color:#94a3b8;font-size:.9rem}
 </style></head>
 <body><div class="wrap">
-<header><h1>🏆 Hall of Wins</h1><p class="sub">All Flip 7 wins ever recorded · ${wins.length} total</p></header>
+<header><h1>🏆 Wins</h1><p class="sub">All Flip 7 wins ever recorded · ${wins.length} total</p></header>
 <div class="card"><h2>Leaderboard</h2>
 ${rows.length === 0 ? '<div class="empty">No wins recorded yet. Finish a game and it&apos;ll show up here.</div>' :
   rows.map((r, i) => {
