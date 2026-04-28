@@ -40,6 +40,25 @@ export function getHTML(): string {
   /* Landing + Lobby shared */
   .box{max-width:420px;margin:20px auto;text-align:center;background:var(--card-bg);
     border:1px solid var(--border);border-radius:16px;padding:28px}
+  /* Chat */
+  .chat-panel{margin:14px auto 0;max-width:520px;background:var(--card-bg);
+    border:1px solid var(--border);border-radius:14px;overflow:hidden}
+  .chat-header{padding:9px 14px;background:rgba(13,148,136,.08);
+    border-bottom:1px solid var(--border);font-size:.7rem;color:var(--teal-light);
+    text-transform:uppercase;letter-spacing:.1em;display:flex;align-items:center;
+    justify-content:space-between;font-weight:700}
+  .chat-log{max-height:200px;overflow-y:auto;padding:10px 14px;
+    display:flex;flex-direction:column;gap:6px;background:var(--bg)}
+  .chat-msg{font-size:.85rem;line-height:1.35;word-break:break-word}
+  .chat-msg .cm-name{font-weight:700;color:var(--teal-light);margin-right:6px}
+  .chat-msg.is-me .cm-name{color:var(--gold-light)}
+  .chat-empty{color:var(--muted);font-size:.78rem;text-align:center;padding:6px 0}
+  .chat-input-row{display:flex;gap:6px;padding:8px;border-top:1px solid var(--border)}
+  .chat-input-row input{flex:1;background:var(--bg);border:1px solid var(--border);
+    color:var(--text);padding:8px 10px;border-radius:8px;font-size:.85rem;outline:none}
+  .chat-input-row input:focus{border-color:var(--teal)}
+  .chat-input-row button{padding:8px 14px;font-size:.72rem;border-radius:8px}
+
   .rejoin-banner{background:rgba(34,197,94,.08);border:1px solid rgba(34,197,94,.3);
     border-radius:12px;padding:14px 16px;margin-bottom:18px;text-align:left}
   .rejoin-banner .rj-text{color:var(--text);font-size:.9rem;margin-bottom:10px;line-height:1.4}
@@ -320,6 +339,16 @@ export function getHTML(): string {
 
   <!-- GAME OVER -->
   <div class="screen" id="sGameOver"><div class="go-box" id="gameOverBox"></div></div>
+
+  <!-- CHAT (visible while in a room) -->
+  <div class="chat-panel" id="chatPanel" style="display:none">
+    <div class="chat-header"><span>Chat</span><span id="chatCount" style="color:var(--muted);font-weight:600;letter-spacing:.04em"></span></div>
+    <div class="chat-log" id="chatLog"><div class="chat-empty">No messages yet.</div></div>
+    <div class="chat-input-row">
+      <input type="text" id="chatInput" placeholder="Say something..." maxlength="300" disabled>
+      <button class="btn btn-teal" onclick="sendChat()" id="chatSendBtn" disabled>Send</button>
+    </div>
+  </div>
 </div>
 
 <div class="modal" id="actionModal">
@@ -389,11 +418,13 @@ function dismissSavedRoom(){
 function newRoom(){
   clearSession();
   if(pollInterval){clearInterval(pollInterval);pollInterval=null}
-  roomCode=null;playerId=null;joined=false;lastJSON='';
+  roomCode=null;playerId=null;joined=false;lastJSON='';lastChatId='';
   document.getElementById('confettiContainer').innerHTML='';
   document.getElementById('rejoinBanner').style.display='none';
   const ji=document.getElementById('joinCode');if(ji)ji.value='';
   const nameRow=document.getElementById('nameRow');if(nameRow)nameRow.style.display='';
+  const log=document.getElementById('chatLog');
+  if(log)log.innerHTML='<div class="chat-empty">No messages yet.</div>';
   show('sLanding');
 }
 
@@ -464,10 +495,14 @@ function renderLobby(s){
   const n=(s.players||[]).length;
   if(n>=2&&joined){btn.classList.remove('btn-disabled');btn.textContent='Start Game ('+n+' players)'}
   else{btn.classList.add('btn-disabled');btn.textContent=n<2?'Need '+(2-n)+' more player'+(2-n>1?'s':''):'Start Game ('+n+')'}
+  renderChat(s);
+  updateChatInputState();
 }
 
 // ===== RENDER GAME STATE =====
 function renderState(s){
+  renderChat(s);
+  updateChatInputState();
   if(s.phase==='lobby'){show('sLobby');renderLobby(s);return}
   if(s.phase==='game-over'){show('sGameOver');renderGameOver(s);return}
   if(s.phase==='round-end'){show('sRoundEnd');renderRoundEnd(s);return}
@@ -683,7 +718,59 @@ function show(id){
   document.querySelectorAll('.screen').forEach(s=>s.classList.remove('active'));
   document.getElementById(id).classList.add('active');
   if(id!=='sLanding')document.getElementById('headerSub').textContent='Room: '+(roomCode||'');
+  // Show chat in lobby/game/round-end/game-over (anywhere we are inside a room)
+  const cp=document.getElementById('chatPanel');
+  if(cp)cp.style.display=(id==='sLanding')?'none':'block';
+  updateChatInputState();
 }
+
+function updateChatInputState(){
+  const input=document.getElementById('chatInput');
+  const btn=document.getElementById('chatSendBtn');
+  if(!input||!btn)return;
+  const enabled=!!playerId&&!!roomCode;
+  input.disabled=!enabled;
+  btn.disabled=!enabled;
+  input.placeholder=enabled?'Say something...':'Join the room to chat';
+}
+
+let lastChatId='';
+function renderChat(state){
+  const log=document.getElementById('chatLog');
+  const countEl=document.getElementById('chatCount');
+  if(!log)return;
+  const msgs=Array.isArray(state.chat)?state.chat:[];
+  if(countEl)countEl.textContent=msgs.length?msgs.length+' message'+(msgs.length===1?'':'s'):'';
+  const newestId=msgs.length?msgs[msgs.length-1].id:'';
+  if(newestId===lastChatId&&log.children.length===Math.max(1,msgs.length))return;
+  lastChatId=newestId;
+  if(msgs.length===0){
+    log.innerHTML='<div class="chat-empty">No messages yet.</div>';
+    return;
+  }
+  log.innerHTML=msgs.map(m=>{
+    const cls='chat-msg'+(m.isMe?' is-me':'');
+    return '<div class="'+cls+'"><span class="cm-name">'+esc(m.senderName)+'</span><span>'+esc(m.body)+'</span></div>';
+  }).join('');
+  log.scrollTop=log.scrollHeight;
+}
+
+function sendChat(){
+  const input=document.getElementById('chatInput');
+  if(!input)return;
+  const text=input.value.trim();
+  if(!text||!roomCode||!playerId)return;
+  fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({gameId:roomCode,playerId,body:text})}).then(r=>r.json()).then(d=>{
+    if(d.error){toast(d.error);return}
+    input.value='';
+    lastJSON=JSON.stringify(d);renderState(d);
+  }).catch(()=>toast('Failed'));
+}
+
+document.getElementById('chatInput').addEventListener('keydown',e=>{
+  if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendChat()}
+});
 function copyCode(){if(roomCode)navigator.clipboard.writeText(roomCode).then(()=>toast('Copied: '+roomCode))}
 function toast(m){const t=document.getElementById('toast');t.textContent=m;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2500)}
 function confetti(){

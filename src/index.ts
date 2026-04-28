@@ -61,6 +61,14 @@ interface PlayerState {
   pendingAction: Card | null;
 }
 
+interface ChatMessage {
+  id: string;
+  senderId: string;
+  senderName: string;
+  body: string;
+  createdAt: number;
+}
+
 interface GameState {
   roomCode: string;
   players: PlayerState[];
@@ -73,7 +81,11 @@ interface GameState {
   targetScore: number;
   lastEvent: string | null;
   winner: string | null;
+  chat: ChatMessage[];
 }
+
+const CHAT_MAX = 100;
+const CHAT_MAX_LEN = 300;
 
 function generateCode(): string {
   const c = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -102,6 +114,7 @@ function createGame(): GameState {
     targetScore: 200,
     lastEvent: null,
     winner: null,
+    chat: [],
   };
 }
 
@@ -396,6 +409,13 @@ function filterForPlayer(game: GameState, playerId: string | null): any {
     winner: game.winner,
     targetScore: game.targetScore,
     deckSize: game.deck.length,
+    chat: (game.chat || []).map(m => ({
+      id: m.id,
+      senderName: m.senderName,
+      body: m.body,
+      createdAt: m.createdAt,
+      isMe: !!playerId && m.senderId === playerId,
+    })),
     players: game.players.map((p, i) => ({
       id: p.id === playerId ? p.id : undefined,
       name: p.name,
@@ -450,7 +470,9 @@ export class Flip7Room {
 
   private async load(): Promise<GameState | null> {
     if (this.game) return this.game;
-    this.game = (await this.state.storage.get<GameState>('game')) ?? null;
+    const stored = (await this.state.storage.get<GameState>('game')) ?? null;
+    if (stored && !Array.isArray(stored.chat)) stored.chat = [];
+    this.game = stored;
     return this.game;
   }
   private async save(): Promise<void> {
@@ -474,6 +496,7 @@ export class Flip7Room {
         case 'action': return await this.doAction(request);
         case 'next-round': return await this.doNextRound(request);
         case 'new-game': return await this.doNewGame(request);
+        case 'chat': return await this.doChat(request);
         default: return json({ error: 'Unknown action' }, 400);
       }
     } catch (e: any) { return json({ error: e.message || 'Internal error' }, 500); }
@@ -631,9 +654,33 @@ export class Flip7Room {
     g.roomCode = game.roomCode;
     g.players = game.players.map(p => newPlayer(p.id, p.name));
     g.phase = 'lobby';
+    g.chat = game.chat || [];
     this.game = g;
     await this.save();
     return json(filterForPlayer(g, body.playerId));
+  }
+
+  private async doChat(request: Request): Promise<Response> {
+    const body = await request.json() as { playerId: string; body: string };
+    const game = await this.load();
+    if (!game) return json({ error: 'Game not found' }, 404);
+    const player = game.players.find(p => p.id === body.playerId);
+    if (!player) return json({ error: 'Player not in this room' }, 403);
+    const text = (body.body || '').trim().slice(0, CHAT_MAX_LEN);
+    if (!text) return json({ error: 'Empty message' }, 400);
+    if (!Array.isArray(game.chat)) game.chat = [];
+    game.chat.push({
+      id: generateId(),
+      senderId: player.id,
+      senderName: player.name,
+      body: text,
+      createdAt: Date.now(),
+    });
+    if (game.chat.length > CHAT_MAX) {
+      game.chat = game.chat.slice(-CHAT_MAX);
+    }
+    await this.save();
+    return json(filterForPlayer(game, body.playerId));
   }
 }
 
@@ -684,6 +731,7 @@ export default {
       '/api/join': 'join', '/api/start': 'start', '/api/hit': 'hit',
       '/api/stay': 'stay', '/api/action': 'action',
       '/api/next-round': 'next-round', '/api/new-game': 'new-game',
+      '/api/chat': 'chat',
     };
     if (request.method === 'POST' && postActions[pathname]) {
       const body = await request.json() as any;
