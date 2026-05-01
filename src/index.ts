@@ -541,9 +541,10 @@ export class Flip7Room {
         case 'new-game': return await this.doNewGame(request);
         case 'chat': return await this.doChat(request);
         case 'publish-key': return await this.doPublishKey(request);
-        case 'voice-state': return await this.doVoiceState(request);
-        case 'voice-signal': return await this.doVoiceSignal(request);
-        case 'voice-drain': return await this.doVoiceDrain(request);
+        // VOICE DISABLED — fix later
+        // case 'voice-state': return await this.doVoiceState(request);
+        // case 'voice-signal': return await this.doVoiceSignal(request);
+        // case 'voice-drain': return await this.doVoiceDrain(request);
         default: return json({ error: 'Unknown action' }, 400);
       }
     } catch (e: any) { return json({ error: e.message || 'Internal error' }, 500); }
@@ -761,6 +762,8 @@ export class Flip7Room {
     return json(filterForPlayer(game, body.playerId));
   }
 
+  /* VOICE DISABLED — fix later. Endpoints + handlers preserved here so
+     the voice mesh can be flipped back on without rewriting the schema.
   private async doVoiceState(request: Request): Promise<Response> {
     const body = await request.json() as { playerId: string; inCall: boolean };
     const game = await this.load();
@@ -812,6 +815,7 @@ export class Flip7Room {
     await this.save();
     return json(filterForPlayer(game, body.playerId));
   }
+  */
 }
 
 function getStub(env: Env, roomCode: string): DurableObjectStub {
@@ -963,6 +967,8 @@ export default {
       return json(wins);
     }
 
+    // VOICE DISABLED — fix later
+    /*
     if (request.method === 'GET' && pathname === '/api/turn-creds') {
       const baseFallback = {
         iceServers: [
@@ -1005,6 +1011,7 @@ export default {
         return json(baseFallback);
       }
     }
+    */
 
     if (request.method === 'POST' && pathname === '/api/create') {
       const roomCode = generateCode();
@@ -1024,9 +1031,10 @@ export default {
       '/api/next-round': 'next-round', '/api/new-game': 'new-game',
       '/api/chat': 'chat',
       '/api/publish-key': 'publish-key',
-      '/api/voice-state': 'voice-state',
-      '/api/voice-signal': 'voice-signal',
-      '/api/voice-drain': 'voice-drain',
+      // VOICE DISABLED — fix later
+      // '/api/voice-state': 'voice-state',
+      // '/api/voice-signal': 'voice-signal',
+      // '/api/voice-drain': 'voice-drain',
     };
     if (request.method === 'POST' && postActions[pathname]) {
       const body = await request.json() as any;

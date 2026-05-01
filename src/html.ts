@@ -372,12 +372,16 @@ export function getHTML(): string {
         <span>Chat</span>
       </span>
       <span class="ch-actions">
+        <!-- VOICE DISABLED — fix later
         <span id="voiceStatus" class="voice-status"></span>
         <button id="voiceBtn" class="btn-voice" onclick="toggleVoice()" disabled>🎙️ Join Voice</button>
         <button id="muteBtn" class="btn-voice secondary" onclick="toggleMute()" style="display:none">🔇</button>
+        -->
       </span>
     </div>
+    <!-- VOICE DISABLED — fix later
     <div id="voiceRoster" class="voice-roster" style="display:none"></div>
+    -->
     <div id="chatBody">
       <div class="chat-log" id="chatLog"><div class="chat-empty">No messages yet.</div></div>
       <div class="chat-input-row">
@@ -498,9 +502,10 @@ function dismissSavedRoom(){
 }
 
 function newRoom(){
-
+  /* VOICE DISABLED — fix later
   if(inCall)void leaveVoice();
   for(const pid of Object.keys(PEERS))closePeer(pid);
+  */
   clearSession();
   if(pollInterval){clearInterval(pollInterval);pollInterval=null}
   roomCode=null;playerId=null;joined=false;lastJSON='';lastChatId='';lastState=null;
@@ -512,8 +517,10 @@ function newRoom(){
   const nameRow=document.getElementById('nameRow');if(nameRow)nameRow.style.display='';
   const log=document.getElementById('chatLog');
   if(log)log.innerHTML='<div class="chat-empty">No messages yet.</div>';
+  /* VOICE DISABLED — fix later
   const roster=document.getElementById('voiceRoster');
   if(roster){roster.style.display='none';roster.innerHTML=''}
+  */
   show('sLanding');
 }
 
@@ -587,24 +594,29 @@ function renderLobby(s){
   else{btn.classList.add('btn-disabled');btn.textContent=n<2?'Need '+(2-n)+' more player'+(2-n>1?'s':''):'Start Game ('+n+')'}
   lastState=s;
   renderChat(s);
+  /* VOICE DISABLED — fix later
   renderVoiceRoster(s);
+  */
   updateChatInputState();
   if(playerId&&!publishedKeyForRoom)void publishKey();
+  /* VOICE DISABLED — fix later
   void reconcilePeers(s);
   void processIncomingSignals(s.signals||[]);
+  */
 }
 
 function renderState(s){
   lastState=s;
   renderChat(s);
+  /* VOICE DISABLED — fix later
   renderVoiceRoster(s);
+  */
   updateChatInputState();
-
   if(playerId&&!publishedKeyForRoom)void publishKey();
-
+  /* VOICE DISABLED — fix later
   void reconcilePeers(s);
-
   void processIncomingSignals(s.signals||[]);
+  */
   if(s.phase==='lobby'){show('sLobby');renderLobby(s);return}
   if(s.phase==='game-over'){show('sGameOver');renderGameOver(s);return}
   if(s.phase==='round-end'){show('sRoundEnd');renderRoundEnd(s);return}
@@ -800,12 +812,14 @@ function startPoll(){
       if(j===lastJSON)return;lastJSON=j;renderState(d);
     }).catch(()=>{});
   }
-  pollInterval=setInterval(tick,inCall?500:1500);
+  pollInterval=setInterval(tick,1500);
 }
+/* VOICE DISABLED — fix later
 function bumpPollSpeed(){
   if(pollInterval){clearInterval(pollInterval);pollInterval=null}
   startPoll();
 }
+*/
 
 function show(id){
   document.querySelectorAll('.screen').forEach(s=>s.classList.remove('active'));
@@ -820,8 +834,10 @@ function show(id){
 function updateChatInputState(){
   const input=document.getElementById('chatInput');
   const btn=document.getElementById('chatSendBtn');
+  /* VOICE DISABLED — fix later
   const voiceBtn=document.getElementById('voiceBtn');
   if(voiceBtn)voiceBtn.disabled=!(playerId&&roomCode);
+  */
   if(!input||!btn)return;
   const enabled=!!playerId&&!!roomCode;
   input.disabled=!enabled;
@@ -899,6 +915,9 @@ function applyChatVisibility(){
 }
 applyChatVisibility();
 
+/* VOICE DISABLED — fix later. Entire WebRTC voice mesh + Shield-encrypted
+   signaling is parked until we get reliable TURN. Chat encryption above
+   stays live; this block is just inert when commented out.
 let ICE_CONFIG={iceServers:[{urls:'stun:stun.cloudflare.com:3478'},{urls:'stun:stun.l.google.com:19302'}]};
 let iceFetchedAt=0;
 async function refreshIceServers(){
@@ -1170,6 +1189,7 @@ async function processIncomingSignals(signals){
       body:JSON.stringify({gameId:roomCode,playerId,ids})}).catch(()=>{});
   }
 }
+*/
 
 function copyCode(){if(roomCode)navigator.clipboard.writeText(roomCode).then(()=>toast('Copied: '+roomCode))}
 function toast(m){const t=document.getElementById('toast');t.textContent=m;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2500)}
