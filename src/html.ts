@@ -913,8 +913,68 @@ function applyChatVisibility(){
 }
 applyChatVisibility();
 // ===== Voice (WebRTC mesh, Shield-encrypted signaling) =====
+// High-fidelity audio: stereo Opus at 510 kbps / 48 kHz, all browser DSP off.
 const ICE_CONFIG={iceServers:[{urls:'stun:stun.cloudflare.com:3478'},{urls:'stun:stun.l.google.com:19302'}]};
+const AUDIO_BITRATE=510000;
+const HQ_AUDIO_CONSTRAINTS={
+  echoCancellation:false,
+  noiseSuppression:false,
+  autoGainControl:false,
+  sampleRate:48000,
+  channelCount:2,
+  sampleSize:16,
+  latency:0,
+};
 const drainQueue=new Set();
+
+// Patch outgoing SDP so Opus advertises stereo + max-quality params on both
+// sides of the negotiation. Without this, browsers default to mono ~32 kbps.
+function boostOpusSdp(sdp){
+  if(!sdp)return sdp;
+  const lines=sdp.split(/\r?\n/);
+  // Find every Opus payload type (there can be multiple — e.g. red, telephone-event)
+  const opusPts=[];
+  for(const l of lines){
+    const m=l.match(/^a=rtpmap:(\d+) opus\/48000/i);
+    if(m)opusPts.push(m[1]);
+  }
+  if(opusPts.length===0)return sdp;
+  const params='stereo=1;sprop-stereo=1;maxaveragebitrate='+AUDIO_BITRATE+';maxplaybackrate=48000;useinbandfec=1;usedtx=0;cbr=0';
+  const out=[];
+  const seenFmtp=new Set();
+  for(const l of lines){
+    let replaced=false;
+    for(const pt of opusPts){
+      if(l.startsWith('a=fmtp:'+pt+' ')){
+        out.push('a=fmtp:'+pt+' '+params);
+        seenFmtp.add(pt);
+        replaced=true;break;
+      }
+    }
+    if(!replaced)out.push(l);
+  }
+  // Insert fmtp lines for any Opus PT that didn't already have one
+  for(const pt of opusPts){
+    if(seenFmtp.has(pt))continue;
+    const i=out.findIndex(l=>new RegExp('^a=rtpmap:'+pt+' opus').test(l));
+    if(i>=0)out.splice(i+1,0,'a=fmtp:'+pt+' '+params);
+  }
+  return out.join('\r\n');
+}
+
+async function maxAudioBitrate(pc){
+  for(const sender of pc.getSenders()){
+    if(sender.track?.kind!=='audio')continue;
+    try{
+      const params=sender.getParameters();
+      if(!params.encodings||!params.encodings.length)params.encodings=[{}];
+      params.encodings[0].maxBitrate=AUDIO_BITRATE;
+      params.encodings[0].priority='high';
+      params.encodings[0].networkPriority='high';
+      await sender.setParameters(params);
+    }catch(e){}
+  }
+}
 
 function updateVoiceButton(){
   const btn=document.getElementById('voiceBtn');
@@ -948,8 +1008,14 @@ async function toggleVoice(){
   if(inCall){await leaveVoice();return}
   await loadShield();
   await publishKey();
-  try{myStream=await navigator.mediaDevices.getUserMedia({audio:true,video:false})}
-  catch(e){toast('Microphone permission denied');return}
+  try{myStream=await navigator.mediaDevices.getUserMedia({audio:HQ_AUDIO_CONSTRAINTS,video:false})}
+  catch(e){
+    // Fall back to default if the browser refuses our constraints (e.g. stereo unavailable on mobile)
+    try{myStream=await navigator.mediaDevices.getUserMedia({audio:true,video:false})}
+    catch(e2){toast('Microphone permission denied');return}
+  }
+  // Tell the encoder to optimize for music-grade fidelity
+  myStream.getAudioTracks().forEach(t=>{try{t.contentHint='music'}catch(e){}});
   inCall=true;muted=false;
   updateVoiceButton();
   await fetch('/api/voice-state',{method:'POST',headers:{'Content-Type':'application/json'},
@@ -1003,8 +1069,10 @@ async function connectToPeer(player,isInitiator){
   PEERS[player.id]={pc,audioEl,dhPub:player.dhPub};
   if(isInitiator){
     const offer=await pc.createOffer();
-    await pc.setLocalDescription(offer);
-    await sendVoiceSignal(player.id,player.dhPub,{type:'offer',sdp:offer.sdp});
+    const sdp=boostOpusSdp(offer.sdp);
+    await pc.setLocalDescription({type:'offer',sdp});
+    await maxAudioBitrate(pc);
+    await sendVoiceSignal(player.id,player.dhPub,{type:'offer',sdp});
   }
   return PEERS[player.id];
 }
@@ -1038,13 +1106,16 @@ async function processIncomingSignals(signals){
       if(payload.type==='offer'){
         const peer=await connectToPeer({id:s.fromPlayerId,dhPub:fromDh},false);
         if(peer){
-          await peer.pc.setRemoteDescription({type:'offer',sdp:payload.sdp});
+          await peer.pc.setRemoteDescription({type:'offer',sdp:boostOpusSdp(payload.sdp)});
           const ans=await peer.pc.createAnswer();
-          await peer.pc.setLocalDescription(ans);
-          await sendVoiceSignal(s.fromPlayerId,fromDh,{type:'answer',sdp:ans.sdp});
+          const ansSdp=boostOpusSdp(ans.sdp);
+          await peer.pc.setLocalDescription({type:'answer',sdp:ansSdp});
+          await maxAudioBitrate(peer.pc);
+          await sendVoiceSignal(s.fromPlayerId,fromDh,{type:'answer',sdp:ansSdp});
         }
       } else if(payload.type==='answer'){
-        await PEERS[s.fromPlayerId]?.pc.setRemoteDescription({type:'answer',sdp:payload.sdp});
+        await PEERS[s.fromPlayerId]?.pc.setRemoteDescription({type:'answer',sdp:boostOpusSdp(payload.sdp)});
+        if(PEERS[s.fromPlayerId])await maxAudioBitrate(PEERS[s.fromPlayerId].pc);
       } else if(payload.type==='ice'&&PEERS[s.fromPlayerId]){
         try{await PEERS[s.fromPlayerId].pc.addIceCandidate(payload.candidate)}catch(e){}
       }
