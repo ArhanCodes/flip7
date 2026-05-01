@@ -4,6 +4,12 @@ export interface Env {
   GAME_ROOM: DurableObjectNamespace;
   STATS: DurableObjectNamespace;
   ASSETS?: { fetch: (req: Request) => Promise<Response> };
+  // Cloudflare Realtime TURN credentials. When both are set, the worker
+  // mints short-lived TURN creds via /api/turn-creds. If unset, voice
+  // still works via STUN — this just means slightly worse coverage on
+  // strict NATs.
+  REALTIME_TURN_KEY_ID?: string;
+  REALTIME_TURN_TOKEN?: string;
 }
 
 // ============================================================
@@ -1006,6 +1012,50 @@ export default {
       const res = await stub.fetch('https://stats/list');
       const wins = await res.json();
       return json(wins);
+    }
+
+    // TURN credentials — short-lived ICE servers minted from Cloudflare Realtime.
+    // Returns { iceServers: [...] } shaped for direct use as RTCPeerConnection config.
+    // Falls back to plain STUN if Realtime isn't wired up yet.
+    if (request.method === 'GET' && pathname === '/api/turn-creds') {
+      const stunOnly = {
+        iceServers: [
+          { urls: 'stun:stun.cloudflare.com:3478' },
+          { urls: 'stun:stun.l.google.com:19302' },
+        ],
+      };
+      const keyId = env.REALTIME_TURN_KEY_ID;
+      const token = env.REALTIME_TURN_TOKEN;
+      if (!keyId || !token) return json(stunOnly);
+      try {
+        const r = await fetch(
+          `https://rtc.live.cloudflare.com/v1/turn/keys/${keyId}/credentials/generate-ica`,
+          {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${token}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ ttl: 43200 }),
+          },
+        );
+        if (!r.ok) return json(stunOnly);
+        const data: any = await r.json();
+        // Cloudflare returns either { iceServers: { urls, username, credential } }
+        // or { iceServers: [ { urls, username, credential } ] } depending on
+        // endpoint version. Normalize both shapes.
+        let turn: any = data?.iceServers;
+        if (turn && !Array.isArray(turn)) turn = [turn];
+        if (!Array.isArray(turn) || turn.length === 0) return json(stunOnly);
+        return json({
+          iceServers: [
+            ...stunOnly.iceServers,
+            ...turn,
+          ],
+        });
+      } catch {
+        return json(stunOnly);
+      }
     }
 
     if (request.method === 'POST' && pathname === '/api/create') {

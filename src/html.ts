@@ -914,7 +914,20 @@ function applyChatVisibility(){
 applyChatVisibility();
 // ===== Voice (WebRTC mesh, Shield-encrypted signaling) =====
 // High-fidelity audio: stereo Opus at 510 kbps / 48 kHz, all browser DSP off.
-const ICE_CONFIG={iceServers:[{urls:'stun:stun.cloudflare.com:3478'},{urls:'stun:stun.l.google.com:19302'}]};
+let ICE_CONFIG={iceServers:[{urls:'stun:stun.cloudflare.com:3478'},{urls:'stun:stun.l.google.com:19302'}]};
+let iceFetchedAt=0;
+async function refreshIceServers(){
+  // Cache for 11 hours (TURN creds are minted with 12h TTL)
+  if(Date.now()-iceFetchedAt<11*3600*1000)return;
+  try{
+    const r=await fetch('/api/turn-creds');
+    const d=await r.json();
+    if(d&&Array.isArray(d.iceServers)&&d.iceServers.length>0){
+      ICE_CONFIG={iceServers:d.iceServers};
+      iceFetchedAt=Date.now();
+    }
+  }catch(e){/* keep STUN-only fallback */}
+}
 const AUDIO_BITRATE=510000;
 const HQ_AUDIO_CONSTRAINTS={
   echoCancellation:false,
@@ -1008,6 +1021,7 @@ async function toggleVoice(){
   if(inCall){await leaveVoice();return}
   await loadShield();
   await publishKey();
+  await refreshIceServers();
   try{myStream=await navigator.mediaDevices.getUserMedia({audio:HQ_AUDIO_CONSTRAINTS,video:false})}
   catch(e){
     // Fall back to default if the browser refuses our constraints (e.g. stereo unavailable on mobile)
