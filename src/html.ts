@@ -1023,14 +1023,9 @@ async function toggleVoice(){
   inCall=true;muted=false;
   updateVoiceButton();updateVoiceStatus();
   bumpPollSpeed();
-  await fetch('/api/voice-state',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({gameId:roomCode,playerId,inCall:true})}).catch(()=>{});
-  if(lastState){
-    for(const p of lastState.players||[]){
-      if(p.isMe||!p.inCall||!p.dhPub||!p.id)continue;
-      await connectToPeer(p,true);
-    }
-  }
+  const r=await fetch('/api/voice-state',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({gameId:roomCode,playerId,inCall:true})}).then(r=>r.json()).catch(()=>null);
+  if(r&&!r.error){lastState=r;lastJSON=JSON.stringify(r);await reconcilePeers(r)}
   updateVoiceStatus();
 }
 async function leaveVoice(){
@@ -1104,9 +1099,18 @@ async function connectToPeer(player,isInitiator){
 
 async function reconcilePeers(state){
   if(!inCall||!state)return;
-  const inCallSet=new Set((state.players||[]).filter(p=>p.inCall&&!p.isMe&&p.dhPub&&p.id).map(p=>p.id));
-
+  const others=(state.players||[]).filter(p=>p.inCall&&!p.isMe&&p.dhPub&&p.id);
+  const inCallSet=new Set(others.map(p=>p.id));
   for(const pid of Object.keys(PEERS))if(!inCallSet.has(pid))closePeer(pid);
+  const myId=playerId||'';
+  for(const p of others){
+    if(PEERS[p.id])continue;
+    if(myId<p.id){
+      console.log('[voice] initiating to',p.id);
+      await connectToPeer(p,true);
+    }
+  }
+  updateVoiceStatus();
 }
 
 async function sendVoiceSignal(toPlayerId,toDhPub,payload){
