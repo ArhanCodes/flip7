@@ -46,7 +46,28 @@ export function getHTML(): string {
   .chat-header{padding:9px 14px;background:rgba(13,148,136,.08);
     border-bottom:1px solid var(--border);font-size:.7rem;color:var(--teal-light);
     text-transform:uppercase;letter-spacing:.1em;display:flex;align-items:center;
-    justify-content:space-between;font-weight:700}
+    justify-content:space-between;font-weight:700;gap:8px}
+  .chat-header .ch-title{display:flex;align-items:center;gap:8px}
+  .chat-header .ch-actions{display:flex;align-items:center;gap:6px}
+  .ch-toggle{background:transparent;border:none;color:var(--teal-light);
+    font-size:1rem;cursor:pointer;padding:0;line-height:1}
+  .ch-shield{font-size:.85rem;opacity:.85}
+  .btn-voice{background:linear-gradient(135deg,#0d9488,#0891b2);color:#fff;
+    border:none;padding:5px 10px;border-radius:8px;font-size:.65rem;font-weight:700;
+    cursor:pointer;letter-spacing:.04em;text-transform:uppercase;line-height:1.2}
+  .btn-voice.secondary{background:rgba(148,163,184,.18);color:var(--text);border:1px solid var(--border)}
+  .btn-voice:disabled{opacity:.55;cursor:not-allowed}
+  .btn-voice.in-call{background:linear-gradient(135deg,#dc2626,#b91c1c)}
+  .voice-roster{padding:10px 14px;background:rgba(8,145,178,.06);
+    border-bottom:1px solid var(--border);display:flex;flex-wrap:wrap;gap:8px}
+  .voice-roster:empty{display:none}
+  .voice-pill{display:inline-flex;align-items:center;gap:6px;
+    background:rgba(8,145,178,.18);color:var(--teal-light);
+    padding:4px 10px;border-radius:999px;font-size:.72rem;font-weight:700}
+  .voice-pill .v-dot{width:7px;height:7px;border-radius:50%;background:#22c55e}
+  .voice-pill.muted .v-dot{background:#94a3b8}
+  .voice-pill.speaking .v-dot{box-shadow:0 0 0 0 #22c55e;animation:vpulse 1s ease-in-out infinite}
+  @keyframes vpulse{0%,100%{box-shadow:0 0 0 0 rgba(34,197,94,.6)}50%{box-shadow:0 0 0 4px rgba(34,197,94,0)}}
   .chat-log{max-height:200px;overflow-y:auto;padding:10px 14px;
     display:flex;flex-direction:column;gap:6px;background:var(--bg)}
   .chat-msg{font-size:.85rem;line-height:1.35;word-break:break-word}
@@ -342,11 +363,24 @@ export function getHTML(): string {
 
   <!-- CHAT (visible while in a room) -->
   <div class="chat-panel" id="chatPanel" style="display:none">
-    <div class="chat-header"><span>Chat</span><span id="chatCount" style="color:var(--muted);font-weight:600;letter-spacing:.04em"></span></div>
-    <div class="chat-log" id="chatLog"><div class="chat-empty">No messages yet.</div></div>
-    <div class="chat-input-row">
-      <input type="text" id="chatInput" placeholder="Say something..." maxlength="300" disabled>
-      <button class="btn btn-teal" onclick="sendChat()" id="chatSendBtn" disabled>Send</button>
+    <div class="chat-header">
+      <span class="ch-title">
+        <button id="chatToggleBtn" class="ch-toggle" onclick="toggleChatPanel()" title="Hide chat">💬</button>
+        <span>Chat</span>
+        <span class="ch-shield" id="chShieldBadge" title="End-to-end encrypted with Shield">🛡️</span>
+      </span>
+      <span class="ch-actions">
+        <button id="voiceBtn" class="btn-voice" onclick="toggleVoice()" disabled>🎙️ Join Voice</button>
+        <button id="muteBtn" class="btn-voice secondary" onclick="toggleMute()" style="display:none">🔇</button>
+      </span>
+    </div>
+    <div id="voiceRoster" class="voice-roster" style="display:none"></div>
+    <div id="chatBody">
+      <div class="chat-log" id="chatLog"><div class="chat-empty">No messages yet.</div></div>
+      <div class="chat-input-row">
+        <input type="text" id="chatInput" placeholder="Say something..." maxlength="280" disabled>
+        <button class="btn btn-teal" onclick="sendChat()" id="chatSendBtn" disabled>Send</button>
+      </div>
     </div>
   </div>
 </div>
@@ -361,6 +395,55 @@ export function getHTML(): string {
 
 <script>
 let roomCode=null,playerId=null,pollInterval=null,lastJSON='',joined=false;
+let shieldReady=false,shieldLoading=null,myIdentity=null,myDhPub=null,publishedKeyForRoom=null,lastState=null;
+let SHIELD={}; // populated by loadShield()
+const PEERS={}; // playerId -> { pc, audioEl, dhPub }
+let myStream=null,inCall=false,muted=false;
+
+// ===== Shield (E2E encryption) =====
+async function loadShield(){
+  if(shieldReady)return;
+  if(shieldLoading)return shieldLoading;
+  shieldLoading=(async()=>{
+    const m=await import('/shield_wasm.js');
+    await m.default({module_or_path:'/shield_wasm_bg.wasm'});
+    SHIELD=m;
+    myIdentity=localStorage.getItem('f7_shield_id');
+    if(!myIdentity){
+      myIdentity=m.generateIdentity(0);
+      localStorage.setItem('f7_shield_id',myIdentity);
+    }
+    myDhPub=m.identityDhPub(myIdentity);
+    shieldReady=true;
+  })();
+  return shieldLoading;
+}
+async function publishKey(){
+  if(!playerId||!roomCode)return;
+  if(publishedKeyForRoom===roomCode&&shieldReady)return;
+  await loadShield();
+  await fetch('/api/publish-key',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({gameId:roomCode,playerId,
+      dhPub:SHIELD.identityDhPub(myIdentity),
+      signingPub:SHIELD.identitySigningPub(myIdentity)})}).catch(()=>{});
+  publishedKeyForRoom=roomCode;
+}
+function encryptForRoom(text,players){
+  if(!shieldReady)return null;
+  const payload=new TextEncoder().encode(text);
+  const envByDh={};
+  for(const p of players){
+    if(!p.dhPub)continue;
+    try{envByDh[p.dhPub]=SHIELD.sealedSeal(p.dhPub,myIdentity,playerId||'unk',payload)}
+    catch(e){console.error('seal failed',e)}
+  }
+  return envByDh;
+}
+function decryptForMe(envelope){
+  if(!envelope||!myIdentity||!shieldReady)return null;
+  try{const r=SHIELD.sealedOpen(envelope,myIdentity);return new TextDecoder().decode(r.payload)}
+  catch(e){return null}
+}
 
 // Session persistence
 function saveSession(){
@@ -405,6 +488,7 @@ function rejoinSavedRoom(){
     } else {
       renderState(d);
     }
+    void publishKey();
     startPoll();
   }).catch(()=>toast('Could not rejoin'));
 }
@@ -416,15 +500,22 @@ function dismissSavedRoom(){
 }
 
 function newRoom(){
+  // Tear down voice + reset chat state so the next room starts clean
+  if(inCall)void leaveVoice();
+  for(const pid of Object.keys(PEERS))closePeer(pid);
   clearSession();
   if(pollInterval){clearInterval(pollInterval);pollInterval=null}
-  roomCode=null;playerId=null;joined=false;lastJSON='';lastChatId='';
+  roomCode=null;playerId=null;joined=false;lastJSON='';lastChatId='';lastState=null;
+  publishedKeyForRoom=null;
+  for(const k of Object.keys(decryptedCache))delete decryptedCache[k];
   document.getElementById('confettiContainer').innerHTML='';
   document.getElementById('rejoinBanner').style.display='none';
   const ji=document.getElementById('joinCode');if(ji)ji.value='';
   const nameRow=document.getElementById('nameRow');if(nameRow)nameRow.style.display='';
   const log=document.getElementById('chatLog');
   if(log)log.innerHTML='<div class="chat-empty">No messages yet.</div>';
+  const roster=document.getElementById('voiceRoster');
+  if(roster){roster.style.display='none';roster.innerHTML=''}
   show('sLanding');
 }
 
@@ -453,6 +544,8 @@ function joinGame(){
     if(d.error){toast(d.error);return}
     playerId=d.playerId;joined=true;saveSession();
     document.getElementById('nameRow').style.display='none';renderLobby(d.game);
+    // Publish encryption key now that we have an identity in this room
+    void publishKey();
   }).catch(()=>toast('Failed'));
 }
 
@@ -495,14 +588,27 @@ function renderLobby(s){
   const n=(s.players||[]).length;
   if(n>=2&&joined){btn.classList.remove('btn-disabled');btn.textContent='Start Game ('+n+' players)'}
   else{btn.classList.add('btn-disabled');btn.textContent=n<2?'Need '+(2-n)+' more player'+(2-n>1?'s':''):'Start Game ('+n+')'}
+  lastState=s;
   renderChat(s);
+  renderVoiceRoster(s);
   updateChatInputState();
+  if(playerId&&!publishedKeyForRoom)void publishKey();
+  void reconcilePeers(s);
+  void processIncomingSignals(s.signals||[]);
 }
 
 // ===== RENDER GAME STATE =====
 function renderState(s){
+  lastState=s;
   renderChat(s);
+  renderVoiceRoster(s);
   updateChatInputState();
+  // Re-publish key once we have a player id but server doesn't know our key yet
+  if(playerId&&!publishedKeyForRoom)void publishKey();
+  // Drive WebRTC: connect to anyone in call we don't yet have a peer for
+  void reconcilePeers(s);
+  // Process any signal envelopes addressed to us
+  void processIncomingSignals(s.signals||[]);
   if(s.phase==='lobby'){show('sLobby');renderLobby(s);return}
   if(s.phase==='game-over'){show('sGameOver');renderGameOver(s);return}
   if(s.phase==='round-end'){show('sRoundEnd');renderRoundEnd(s);return}
@@ -727,6 +833,8 @@ function show(id){
 function updateChatInputState(){
   const input=document.getElementById('chatInput');
   const btn=document.getElementById('chatSendBtn');
+  const voiceBtn=document.getElementById('voiceBtn');
+  if(voiceBtn)voiceBtn.disabled=!(playerId&&roomCode);
   if(!input||!btn)return;
   const enabled=!!playerId&&!!roomCode;
   input.disabled=!enabled;
@@ -734,34 +842,47 @@ function updateChatInputState(){
   input.placeholder=enabled?'Say something...':'Join the room to chat';
 }
 
-let lastChatId='';
+let lastChatId='',lastChatMsgs=null;
+const decryptedCache={}; // msg.id -> plaintext
 function renderChat(state){
   const log=document.getElementById('chatLog');
-  const countEl=document.getElementById('chatCount');
   if(!log)return;
   const msgs=Array.isArray(state.chat)?state.chat:[];
-  if(countEl)countEl.textContent=msgs.length?msgs.length+' message'+(msgs.length===1?'':'s'):'';
   const newestId=msgs.length?msgs[msgs.length-1].id:'';
   if(newestId===lastChatId&&log.children.length===Math.max(1,msgs.length))return;
   lastChatId=newestId;
+  lastChatMsgs=msgs;
   if(msgs.length===0){
     log.innerHTML='<div class="chat-empty">No messages yet.</div>';
     return;
   }
   log.innerHTML=msgs.map(m=>{
+    let body=decryptedCache[m.id];
+    if(body===undefined){
+      body=m.envelope?decryptForMe(m.envelope):null;
+      if(body!==null)decryptedCache[m.id]=body;
+    }
+    const display=body!==null?esc(body):'<span style="color:var(--muted);font-style:italic">🛡️ encrypted</span>';
     const cls='chat-msg'+(m.isMe?' is-me':'');
-    return '<div class="'+cls+'"><span class="cm-name">'+esc(m.senderName)+'</span><span>'+esc(m.body)+'</span></div>';
+    return '<div class="'+cls+'"><span class="cm-name">'+esc(m.senderName)+'</span><span>'+display+'</span></div>';
   }).join('');
   log.scrollTop=log.scrollHeight;
 }
 
-function sendChat(){
+async function sendChat(){
   const input=document.getElementById('chatInput');
   if(!input)return;
   const text=input.value.trim();
   if(!text||!roomCode||!playerId)return;
+  if(!shieldReady){await loadShield();await publishKey()}
+  // Encrypt for every player who has a key (and ourselves so we can decrypt our own messages from history)
+  const players=(lastState&&lastState.players)?lastState.players.filter(p=>p.dhPub):[];
+  // Make sure we're included so re-renders can decrypt our own
+  if(myDhPub&&!players.some(p=>p.dhPub===myDhPub))players.push({dhPub:myDhPub});
+  const envByDh=encryptForRoom(text,players);
+  if(!envByDh||Object.keys(envByDh).length===0){toast('Waiting for keys…');return}
   fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({gameId:roomCode,playerId,body:text})}).then(r=>r.json()).then(d=>{
+    body:JSON.stringify({gameId:roomCode,playerId,envByDh})}).then(r=>r.json()).then(d=>{
     if(d.error){toast(d.error);return}
     input.value='';
     lastJSON=JSON.stringify(d);renderState(d);
@@ -771,6 +892,172 @@ function sendChat(){
 document.getElementById('chatInput').addEventListener('keydown',e=>{
   if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendChat()}
 });
+
+// ===== Chat panel collapse / toggle =====
+function chatVisible(){const v=localStorage.getItem('f7_chat_visible');return v===null?true:v==='1'}
+function toggleChatPanel(){
+  const cur=chatVisible();
+  localStorage.setItem('f7_chat_visible',cur?'0':'1');
+  applyChatVisibility();
+}
+function applyChatVisibility(){
+  const body=document.getElementById('chatBody');
+  const btn=document.getElementById('chatToggleBtn');
+  const panel=document.getElementById('chatPanel');
+  if(!body||!btn||!panel)return;
+  const v=chatVisible();
+  body.style.display=v?'':'none';
+  btn.title=v?'Hide chat':'Show chat';
+  btn.textContent=v?'💬':'💭';
+  panel.classList.toggle('collapsed',!v);
+}
+applyChatVisibility();
+// ===== Voice (WebRTC mesh, Shield-encrypted signaling) =====
+const ICE_CONFIG={iceServers:[{urls:'stun:stun.cloudflare.com:3478'},{urls:'stun:stun.l.google.com:19302'}]};
+const drainQueue=new Set();
+
+function updateVoiceButton(){
+  const btn=document.getElementById('voiceBtn');
+  const muteBtn=document.getElementById('muteBtn');
+  if(!btn)return;
+  btn.disabled=!(playerId&&roomCode);
+  if(inCall){btn.classList.add('in-call');btn.textContent='📞 Leave Voice'}
+  else{btn.classList.remove('in-call');btn.textContent='🎙️ Join Voice'}
+  if(muteBtn){
+    muteBtn.style.display=inCall?'':'none';
+    muteBtn.textContent=muted?'🔇 Unmute':'🎤 Mute';
+  }
+}
+
+function renderVoiceRoster(state){
+  const roster=document.getElementById('voiceRoster');
+  if(!roster)return;
+  const inCallPlayers=(state.players||[]).filter(p=>p.inCall);
+  if(inCallPlayers.length===0){roster.style.display='none';roster.innerHTML='';updateVoiceButton();return}
+  roster.style.display='flex';
+  roster.innerHTML=inCallPlayers.map(p=>{
+    const me=p.isMe;
+    const mutedCls=me&&muted?' muted':'';
+    return '<span class="voice-pill'+mutedCls+'"><span class="v-dot"></span>'+esc(p.name)+(me?' (you)':'')+'</span>';
+  }).join('');
+  updateVoiceButton();
+}
+
+async function toggleVoice(){
+  if(!playerId||!roomCode)return;
+  if(inCall){await leaveVoice();return}
+  await loadShield();
+  await publishKey();
+  try{myStream=await navigator.mediaDevices.getUserMedia({audio:true,video:false})}
+  catch(e){toast('Microphone permission denied');return}
+  inCall=true;muted=false;
+  updateVoiceButton();
+  await fetch('/api/voice-state',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({gameId:roomCode,playerId,inCall:true})}).catch(()=>{});
+  // Initiate offers to anyone already in the call
+  if(lastState){
+    for(const p of lastState.players||[]){
+      if(p.isMe||!p.inCall||!p.dhPub||!p.id)continue;
+      await connectToPeer(p,true);
+    }
+  }
+}
+async function leaveVoice(){
+  inCall=false;muted=false;
+  for(const pid of Object.keys(PEERS))closePeer(pid);
+  if(myStream){myStream.getTracks().forEach(t=>t.stop());myStream=null}
+  updateVoiceButton();
+  await fetch('/api/voice-state',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({gameId:roomCode,playerId,inCall:false})}).catch(()=>{});
+}
+function toggleMute(){
+  if(!myStream)return;
+  muted=!muted;
+  myStream.getAudioTracks().forEach(t=>t.enabled=!muted);
+  updateVoiceButton();
+  if(lastState)renderVoiceRoster(lastState);
+}
+
+function closePeer(pid){
+  const peer=PEERS[pid];if(!peer)return;
+  try{peer.pc.close()}catch(e){}
+  if(peer.audioEl){peer.audioEl.srcObject=null;peer.audioEl.remove()}
+  delete PEERS[pid];
+}
+
+async function connectToPeer(player,isInitiator){
+  if(!inCall||!myStream)return;
+  if(PEERS[player.id])return PEERS[player.id];
+  const pc=new RTCPeerConnection(ICE_CONFIG);
+  const audioEl=document.createElement('audio');
+  audioEl.autoplay=true;audioEl.playsInline=true;
+  document.body.appendChild(audioEl);
+  for(const track of myStream.getTracks())pc.addTrack(track,myStream);
+  pc.ontrack=e=>{audioEl.srcObject=e.streams[0]};
+  pc.onicecandidate=async e=>{
+    if(e.candidate)await sendVoiceSignal(player.id,player.dhPub,{type:'ice',candidate:e.candidate.toJSON?e.candidate.toJSON():e.candidate});
+  };
+  pc.onconnectionstatechange=()=>{
+    if(pc.connectionState==='failed'||pc.connectionState==='closed')closePeer(player.id);
+  };
+  PEERS[player.id]={pc,audioEl,dhPub:player.dhPub};
+  if(isInitiator){
+    const offer=await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    await sendVoiceSignal(player.id,player.dhPub,{type:'offer',sdp:offer.sdp});
+  }
+  return PEERS[player.id];
+}
+
+async function reconcilePeers(state){
+  if(!inCall||!state)return;
+  const inCallSet=new Set((state.players||[]).filter(p=>p.inCall&&!p.isMe&&p.dhPub&&p.id).map(p=>p.id));
+  // Drop peers who left the call
+  for(const pid of Object.keys(PEERS))if(!inCallSet.has(pid))closePeer(pid);
+}
+
+async function sendVoiceSignal(toPlayerId,toDhPub,payload){
+  if(!shieldReady||!toDhPub)return;
+  const data=new TextEncoder().encode(JSON.stringify(payload));
+  let envelope;
+  try{envelope=SHIELD.sealedSeal(toDhPub,myIdentity,playerId||'unk',data)}catch(e){return}
+  await fetch('/api/voice-signal',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({gameId:roomCode,playerId,toPlayerId,envelope})}).catch(()=>{});
+}
+
+async function processIncomingSignals(signals){
+  if(!signals||!signals.length||!inCall||!shieldReady)return;
+  for(const s of signals){
+    if(drainQueue.has(s.id))continue;
+    drainQueue.add(s.id);
+    try{
+      const r=SHIELD.sealedOpen(s.envelope,myIdentity);
+      const payload=JSON.parse(new TextDecoder().decode(r.payload));
+      const fromPlayer=lastState&&lastState.players?lastState.players.find(p=>p.id===s.fromPlayerId):null;
+      const fromDh=fromPlayer?.dhPub;
+      if(payload.type==='offer'){
+        const peer=await connectToPeer({id:s.fromPlayerId,dhPub:fromDh},false);
+        if(peer){
+          await peer.pc.setRemoteDescription({type:'offer',sdp:payload.sdp});
+          const ans=await peer.pc.createAnswer();
+          await peer.pc.setLocalDescription(ans);
+          await sendVoiceSignal(s.fromPlayerId,fromDh,{type:'answer',sdp:ans.sdp});
+        }
+      } else if(payload.type==='answer'){
+        await PEERS[s.fromPlayerId]?.pc.setRemoteDescription({type:'answer',sdp:payload.sdp});
+      } else if(payload.type==='ice'&&PEERS[s.fromPlayerId]){
+        try{await PEERS[s.fromPlayerId].pc.addIceCandidate(payload.candidate)}catch(e){}
+      }
+    }catch(e){}
+  }
+  // Drain consumed ids on the server
+  if(drainQueue.size>0){
+    const ids=Array.from(drainQueue);drainQueue.clear();
+    await fetch('/api/voice-drain',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({gameId:roomCode,playerId,ids})}).catch(()=>{});
+  }
+}
+
 function copyCode(){if(roomCode)navigator.clipboard.writeText(roomCode).then(()=>toast('Copied: '+roomCode))}
 function toast(m){const t=document.getElementById('toast');t.textContent=m;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2500)}
 function confetti(){

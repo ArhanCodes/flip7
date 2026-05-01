@@ -3,6 +3,7 @@ import { getHTML } from './html';
 export interface Env {
   GAME_ROOM: DurableObjectNamespace;
   STATS: DurableObjectNamespace;
+  ASSETS?: { fetch: (req: Request) => Promise<Response> };
 }
 
 // ============================================================
@@ -60,13 +61,30 @@ interface PlayerState {
   flipped7: boolean;
   pendingFlip3: number;
   pendingAction: Card | null;
+  // Shield identity public keys (base64). Set by client after WASM init.
+  dhPub?: string;
+  signingPub?: string;
+  // Voice call state
+  inCall?: boolean;
+  // Pending voice signaling envelopes addressed to this player.
+  // Each is a sealed-sender envelope (Shield) carrying SDP/ICE.
+  signals?: VoiceSignal[];
+}
+
+interface VoiceSignal {
+  id: string;
+  fromPlayerId: string;
+  envelope: string; // base64 sealed-sender envelope
+  createdAt: number;
 }
 
 interface ChatMessage {
   id: string;
   senderId: string;
   senderName: string;
-  body: string;
+  // Map of recipient dhPub → base64 sealed-sender envelope.
+  // Each player decrypts only the entry whose key matches their own dhPub.
+  envByDh: Record<string, string>;
   createdAt: number;
 }
 
@@ -87,7 +105,8 @@ interface GameState {
 }
 
 const CHAT_MAX = 100;
-const CHAT_MAX_LEN = 300;
+const CHAT_MAX_LEN = 4096; // ciphertext is bigger than plaintext
+const SIGNAL_MAX_LEN = 16384; // SDP can be ~3-5 KB; allow headroom
 
 function generateCode(): string {
   const c = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -411,16 +430,25 @@ function filterForPlayer(game: GameState, playerId: string | null): any {
     winner: game.winner,
     targetScore: game.targetScore,
     deckSize: game.deck.length,
-    chat: (game.chat || []).map(m => ({
-      id: m.id,
-      senderName: m.senderName,
-      body: m.body,
-      createdAt: m.createdAt,
-      isMe: !!playerId && m.senderId === playerId,
-    })),
+    chat: (game.chat || []).map(m => {
+      const me = playerId ? game.players.find(p => p.id === playerId) : null;
+      const myDh = me?.dhPub;
+      return {
+        id: m.id,
+        senderName: m.senderName,
+        senderId: m.senderId,
+        // Only ship the envelope addressed to this caller
+        envelope: myDh && m.envByDh ? (m.envByDh[myDh] ?? null) : null,
+        createdAt: m.createdAt,
+        isMe: !!playerId && m.senderId === playerId,
+      };
+    }),
     players: game.players.map((p, i) => ({
       id: p.id === playerId ? p.id : undefined,
       name: p.name,
+      dhPub: p.dhPub,
+      signingPub: p.signingPub,
+      inCall: !!p.inCall,
       cards: p.cards.map(c => ({
         type: c.type,
         value: c.value,
@@ -440,6 +468,12 @@ function filterForPlayer(game: GameState, playerId: string | null): any {
       isDealer: i === game.dealerIdx,
       isMe: p.id === playerId,
     })),
+    // Voice signals addressed to this player; client should drain these
+    signals: (() => {
+      if (!playerId) return [];
+      const me = game.players.find(p => p.id === playerId);
+      return me?.signals ?? [];
+    })(),
     _playerId: playerId,
   };
 }
@@ -493,7 +527,15 @@ export class Flip7Room {
   private async load(): Promise<GameState | null> {
     if (this.game) return this.game;
     const stored = (await this.state.storage.get<GameState>('game')) ?? null;
-    if (stored && !Array.isArray(stored.chat)) stored.chat = [];
+    if (stored) {
+      if (!Array.isArray(stored.chat)) stored.chat = [];
+      // Drop legacy plaintext chat (no envByDh) — incompatible with E2EE schema
+      stored.chat = stored.chat.filter(m => m && (m as any).envByDh && typeof (m as any).envByDh === 'object');
+      // Ensure each player has signals array (older saves don't have it)
+      for (const p of stored.players) {
+        if (!Array.isArray(p.signals)) p.signals = [];
+      }
+    }
     this.game = stored;
     return this.game;
   }
@@ -528,6 +570,10 @@ export class Flip7Room {
         case 'next-round': return await this.doNextRound(request);
         case 'new-game': return await this.doNewGame(request);
         case 'chat': return await this.doChat(request);
+        case 'publish-key': return await this.doPublishKey(request);
+        case 'voice-state': return await this.doVoiceState(request);
+        case 'voice-signal': return await this.doVoiceSignal(request);
+        case 'voice-drain': return await this.doVoiceDrain(request);
         default: return json({ error: 'Unknown action' }, 400);
       }
     } catch (e: any) { return json({ error: e.message || 'Internal error' }, 500); }
@@ -683,32 +729,119 @@ export class Flip7Room {
     if (!game) return json({ error: 'Game not found' }, 404);
     const g = createGame();
     g.roomCode = game.roomCode;
-    g.players = game.players.map(p => newPlayer(p.id, p.name));
+    // Carry over players AND their published Shield keys / call state so chat
+    // and voice keep working across rounds.
+    g.players = game.players.map(p => {
+      const np = newPlayer(p.id, p.name);
+      np.dhPub = p.dhPub;
+      np.signingPub = p.signingPub;
+      np.inCall = false;
+      np.signals = [];
+      return np;
+    });
     g.phase = 'lobby';
-    g.chat = game.chat || [];
+    g.chat = Array.isArray(game.chat) ? game.chat.filter(m => m && (m as any).envByDh) : [];
     this.game = g;
     await this.save();
     return json(filterForPlayer(g, body.playerId));
   }
 
   private async doChat(request: Request): Promise<Response> {
-    const body = await request.json() as { playerId: string; body: string };
+    // Encrypted chat: client provides one sealed-sender envelope per recipient
+    // (keyed by recipient dhPub). The server stores the bag of envelopes; each
+    // poller only sees the envelope addressed to them.
+    const body = await request.json() as { playerId: string; envByDh: Record<string, string> };
     const game = await this.load();
     if (!game) return json({ error: 'Game not found' }, 404);
     const player = game.players.find(p => p.id === body.playerId);
     if (!player) return json({ error: 'Player not in this room' }, 403);
-    const text = (body.body || '').trim().slice(0, CHAT_MAX_LEN);
-    if (!text) return json({ error: 'Empty message' }, 400);
+    if (!body.envByDh || typeof body.envByDh !== 'object') return json({ error: 'envByDh required' }, 400);
+    // Only accept envelopes addressed to known recipients, and cap size
+    const sanitized: Record<string, string> = {};
+    const knownDhs = new Set(game.players.map(p => p.dhPub).filter(Boolean) as string[]);
+    for (const [dh, env] of Object.entries(body.envByDh)) {
+      if (!knownDhs.has(dh)) continue;
+      if (typeof env !== 'string' || env.length > CHAT_MAX_LEN) continue;
+      sanitized[dh] = env;
+    }
+    if (Object.keys(sanitized).length === 0) return json({ error: 'No valid envelopes' }, 400);
     if (!Array.isArray(game.chat)) game.chat = [];
     game.chat.push({
       id: generateId(),
       senderId: player.id,
       senderName: player.name,
-      body: text,
+      envByDh: sanitized,
       createdAt: Date.now(),
     });
     if (game.chat.length > CHAT_MAX) {
       game.chat = game.chat.slice(-CHAT_MAX);
+    }
+    await this.save();
+    return json(filterForPlayer(game, body.playerId));
+  }
+
+  private async doPublishKey(request: Request): Promise<Response> {
+    const body = await request.json() as { playerId: string; dhPub: string; signingPub: string };
+    const game = await this.load();
+    if (!game) return json({ error: 'Game not found' }, 404);
+    const player = game.players.find(p => p.id === body.playerId);
+    if (!player) return json({ error: 'Player not in this room' }, 403);
+    if (typeof body.dhPub !== 'string' || body.dhPub.length > 256) return json({ error: 'bad dhPub' }, 400);
+    if (typeof body.signingPub !== 'string' || body.signingPub.length > 256) return json({ error: 'bad signingPub' }, 400);
+    player.dhPub = body.dhPub;
+    player.signingPub = body.signingPub;
+    await this.save();
+    return json(filterForPlayer(game, body.playerId));
+  }
+
+  private async doVoiceState(request: Request): Promise<Response> {
+    const body = await request.json() as { playerId: string; inCall: boolean };
+    const game = await this.load();
+    if (!game) return json({ error: 'Game not found' }, 404);
+    const player = game.players.find(p => p.id === body.playerId);
+    if (!player) return json({ error: 'Player not in this room' }, 403);
+    player.inCall = !!body.inCall;
+    if (!player.inCall) player.signals = []; // drop any pending signals on leave
+    await this.save();
+    return json(filterForPlayer(game, body.playerId));
+  }
+
+  private async doVoiceSignal(request: Request): Promise<Response> {
+    // Send a Shield-encrypted signaling envelope (offer / answer / ICE) to a
+    // specific peer. The worker is just a relay — it cannot decrypt the body.
+    const body = await request.json() as { playerId: string; toPlayerId: string; envelope: string };
+    const game = await this.load();
+    if (!game) return json({ error: 'Game not found' }, 404);
+    const sender = game.players.find(p => p.id === body.playerId);
+    if (!sender) return json({ error: 'Sender not in this room' }, 403);
+    const recipient = game.players.find(p => p.id === body.toPlayerId);
+    if (!recipient) return json({ error: 'Recipient not found' }, 404);
+    if (typeof body.envelope !== 'string' || body.envelope.length > SIGNAL_MAX_LEN) {
+      return json({ error: 'bad envelope' }, 400);
+    }
+    if (!Array.isArray(recipient.signals)) recipient.signals = [];
+    recipient.signals.push({
+      id: generateId(),
+      fromPlayerId: sender.id,
+      envelope: body.envelope,
+      createdAt: Date.now(),
+    });
+    // Cap to last 200 to avoid runaway storage on stuck clients
+    if (recipient.signals.length > 200) recipient.signals = recipient.signals.slice(-200);
+    await this.save();
+    return json({ ok: true });
+  }
+
+  private async doVoiceDrain(request: Request): Promise<Response> {
+    // Client confirms it has consumed signal IDs up through the supplied list.
+    const body = await request.json() as { playerId: string; ids: string[] };
+    const game = await this.load();
+    if (!game) return json({ error: 'Game not found' }, 404);
+    const player = game.players.find(p => p.id === body.playerId);
+    if (!player) return json({ error: 'Player not in this room' }, 403);
+    const drainSet = new Set(body.ids ?? []);
+    if (Array.isArray(player.signals)) {
+      player.signals = player.signals.filter(s => !drainSet.has(s.id));
     }
     await this.save();
     return json(filterForPlayer(game, body.playerId));
@@ -893,6 +1026,10 @@ export default {
       '/api/stay': 'stay', '/api/action': 'action',
       '/api/next-round': 'next-round', '/api/new-game': 'new-game',
       '/api/chat': 'chat',
+      '/api/publish-key': 'publish-key',
+      '/api/voice-state': 'voice-state',
+      '/api/voice-signal': 'voice-signal',
+      '/api/voice-drain': 'voice-drain',
     };
     if (request.method === 'POST' && postActions[pathname]) {
       const body = await request.json() as any;
