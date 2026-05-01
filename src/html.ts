@@ -984,14 +984,18 @@ function updateVoiceStatus(){
   const el=document.getElementById('voiceStatus');
   if(!el)return;
   if(!inCall){el.textContent='';el.className='voice-status';return}
+  const others=lastState&&lastState.players?lastState.players.filter(p=>p.inCall&&!p.isMe):[];
+  if(others.length===0){el.textContent='alone in call';el.className='voice-status warn';return}
   const peers=Object.values(PEERS);
-  if(peers.length===0){el.textContent='waiting…';el.className='voice-status warn';return}
-  const states=peers.map(p=>p.pc.connectionState);
-  const connected=states.filter(s=>s==='connected').length;
-  const failed=states.filter(s=>s==='failed'||s==='disconnected').length;
-  if(failed>0){el.textContent='connection failed';el.className='voice-status err'}
+  if(peers.length===0){el.textContent='waiting for offer · '+others.length+' here';el.className='voice-status warn';return}
+  const states=peers.map(p=>p.pc.iceConnectionState||p.pc.connectionState);
+  const connected=states.filter(s=>s==='connected'||s==='completed').length;
+  const failed=states.filter(s=>s==='failed').length;
+  const checking=states.filter(s=>s==='checking'||s==='new').length;
+  if(failed>0&&connected===0){el.textContent='failed · NAT/TURN blocked';el.className='voice-status err'}
   else if(connected===peers.length){el.textContent='connected · '+connected;el.className='voice-status ok'}
-  else{el.textContent='connecting · '+connected+'/'+peers.length;el.className='voice-status warn'}
+  else if(checking>0){el.textContent='connecting · '+connected+'/'+peers.length;el.className='voice-status warn'}
+  else{el.textContent=states[0]+' · '+connected+'/'+peers.length;el.className='voice-status warn'}
 }
 
 function renderVoiceRoster(state){
@@ -1076,14 +1080,19 @@ async function connectToPeer(player,isInitiator){
     if(e.candidate)await sendVoiceSignal(player.id,player.dhPub,{type:'ice',candidate:e.candidate.toJSON?e.candidate.toJSON():e.candidate});
   };
   pc.onconnectionstatechange=()=>{
-    console.log('[voice] peer',player.id,'state:',pc.connectionState);
+    console.log('[voice] peer',player.id,'connectionState:',pc.connectionState);
     updateVoiceStatus();
-    if(pc.connectionState==='failed')toast('Voice connection failed — check network');
-    if(pc.connectionState==='failed'||pc.connectionState==='closed')closePeer(player.id);
+
+    if(pc.connectionState==='closed')closePeer(player.id);
   };
   pc.oniceconnectionstatechange=()=>{
-    console.log('[voice] ice',player.id,':',pc.iceConnectionState);
+    console.log('[voice] peer',player.id,'iceState:',pc.iceConnectionState);
     updateVoiceStatus();
+    if(pc.iceConnectionState==='failed'){
+
+      console.log('[voice] ICE failed, restarting');
+      try{pc.restartIce()}catch(e){}
+    }
   };
   PEERS[player.id]={pc,audioEl,dhPub:player.dhPub};
   updateVoiceStatus();
@@ -1114,22 +1123,26 @@ async function reconcilePeers(state){
 }
 
 async function sendVoiceSignal(toPlayerId,toDhPub,payload){
-  if(!shieldReady||!toDhPub)return;
+  if(!shieldReady||!toDhPub){console.warn('[voice] cannot send: shieldReady=',shieldReady,'toDhPub=',!!toDhPub);return}
   const data=new TextEncoder().encode(JSON.stringify(payload));
   let envelope;
-  try{envelope=SHIELD.sealedSeal(toDhPub,myIdentity,playerId||'unk',data)}catch(e){return}
+  try{envelope=SHIELD.sealedSeal(toDhPub,myIdentity,playerId||'unk',data)}
+  catch(e){console.error('[voice] sealedSeal failed',e);return}
+  console.log('[voice] sending',payload.type,'to',toPlayerId);
   await fetch('/api/voice-signal',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({gameId:roomCode,playerId,toPlayerId,envelope})}).catch(()=>{});
+    body:JSON.stringify({gameId:roomCode,playerId,toPlayerId,envelope})}).catch(e=>console.error('[voice] signal POST failed',e));
 }
 
 async function processIncomingSignals(signals){
   if(!signals||!signals.length||!inCall||!shieldReady)return;
+  console.log('[voice] processing',signals.length,'signals');
   for(const s of signals){
     if(drainQueue.has(s.id))continue;
     drainQueue.add(s.id);
     try{
       const r=SHIELD.sealedOpen(s.envelope,myIdentity);
       const payload=JSON.parse(new TextDecoder().decode(r.payload));
+      console.log('[voice] received',payload.type,'from',s.fromPlayerId);
       const fromPlayer=lastState&&lastState.players?lastState.players.find(p=>p.id===s.fromPlayerId):null;
       const fromDh=fromPlayer?.dhPub;
       if(payload.type==='offer'){
