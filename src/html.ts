@@ -51,7 +51,10 @@ export function getHTML(): string {
   .chat-header .ch-actions{display:flex;align-items:center;gap:6px}
   .ch-toggle{background:transparent;border:none;color:var(--teal-light);
     font-size:1rem;cursor:pointer;padding:0;line-height:1}
-  .ch-shield{font-size:.85rem;opacity:.85}
+  .voice-status{font-size:.65rem;color:var(--muted);font-weight:600;letter-spacing:.05em}
+  .voice-status.ok{color:var(--green-light)}
+  .voice-status.warn{color:var(--gold-light)}
+  .voice-status.err{color:var(--red-light)}
   .btn-voice{background:linear-gradient(135deg,#0d9488,#0891b2);color:#fff;
     border:none;padding:5px 10px;border-radius:8px;font-size:.65rem;font-weight:700;
     cursor:pointer;letter-spacing:.04em;text-transform:uppercase;line-height:1.2}
@@ -367,9 +370,9 @@ export function getHTML(): string {
       <span class="ch-title">
         <button id="chatToggleBtn" class="ch-toggle" onclick="toggleChatPanel()" title="Hide chat">💬</button>
         <span>Chat</span>
-        <span class="ch-shield" id="chShieldBadge" title="End-to-end encrypted with Shield">🛡️</span>
       </span>
       <span class="ch-actions">
+        <span id="voiceStatus" class="voice-status"></span>
         <button id="voiceBtn" class="btn-voice" onclick="toggleVoice()" disabled>🎙️ Join Voice</button>
         <button id="muteBtn" class="btn-voice secondary" onclick="toggleMute()" style="display:none">🔇</button>
       </span>
@@ -789,14 +792,19 @@ function esc(s){return (s||'').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
 
 function startPoll(){
   if(pollInterval)clearInterval(pollInterval);
-  pollInterval=setInterval(()=>{
+  function tick(){
     if(!roomCode)return;
     const url='/api/game/'+roomCode+(playerId?'?playerId='+playerId:'');
     fetch(url).then(r=>r.json()).then(d=>{
       if(d.error)return;const j=JSON.stringify(d);
       if(j===lastJSON)return;lastJSON=j;renderState(d);
     }).catch(()=>{});
-  },1500);
+  }
+  pollInterval=setInterval(tick,inCall?500:1500);
+}
+function bumpPollSpeed(){
+  if(pollInterval){clearInterval(pollInterval);pollInterval=null}
+  startPoll();
 }
 
 function show(id){
@@ -841,7 +849,7 @@ function renderChat(state){
       body=m.envelope?decryptForMe(m.envelope):null;
       if(body!==null)decryptedCache[m.id]=body;
     }
-    const display=body!==null?esc(body):'<span style="color:var(--muted);font-style:italic">🛡️ encrypted</span>';
+    const display=body!==null?esc(body):'<span style="color:var(--muted);font-style:italic">encrypted</span>';
     const cls='chat-msg'+(m.isMe?' is-me':'');
     return '<div class="'+cls+'"><span class="cm-name">'+esc(m.senderName)+'</span><span>'+display+'</span></div>';
   }).join('');
@@ -894,7 +902,6 @@ applyChatVisibility();
 let ICE_CONFIG={iceServers:[{urls:'stun:stun.cloudflare.com:3478'},{urls:'stun:stun.l.google.com:19302'}]};
 let iceFetchedAt=0;
 async function refreshIceServers(){
-
   if(Date.now()-iceFetchedAt<11*3600*1000)return;
   try{
     const r=await fetch('/api/turn-creds');
@@ -905,29 +912,27 @@ async function refreshIceServers(){
     }
   }catch(e){}
 }
-const AUDIO_BITRATE=510000;
+
+const AUDIO_BITRATE=64000;
 const HQ_AUDIO_CONSTRAINTS={
-  echoCancellation:false,
-  noiseSuppression:false,
-  autoGainControl:false,
+  echoCancellation:true,
+  noiseSuppression:true,
+  autoGainControl:true,
   sampleRate:48000,
-  channelCount:2,
-  sampleSize:16,
-  latency:0,
+  channelCount:1,
 };
 const drainQueue=new Set();
 
 function boostOpusSdp(sdp){
   if(!sdp)return sdp;
   const lines=sdp.split(/\\r?\\n/);
-
   const opusPts=[];
   for(const l of lines){
     const m=l.match(/^a=rtpmap:(\\d+) opus\\/48000/i);
     if(m)opusPts.push(m[1]);
   }
   if(opusPts.length===0)return sdp;
-  const params='stereo=1;sprop-stereo=1;maxaveragebitrate='+AUDIO_BITRATE+';maxplaybackrate=48000;useinbandfec=1;usedtx=0;cbr=0';
+  const params='maxaveragebitrate='+AUDIO_BITRATE+';maxplaybackrate=48000;useinbandfec=1;usedtx=1';
   const out=[];
   const seenFmtp=new Set();
   for(const l of lines){
@@ -941,7 +946,6 @@ function boostOpusSdp(sdp){
     }
     if(!replaced)out.push(l);
   }
-
   for(const pt of opusPts){
     if(seenFmtp.has(pt))continue;
     const i=out.findIndex(l=>new RegExp('^a=rtpmap:'+pt+' opus').test(l));
@@ -976,6 +980,19 @@ function updateVoiceButton(){
     muteBtn.textContent=muted?'🔇 Unmute':'🎤 Mute';
   }
 }
+function updateVoiceStatus(){
+  const el=document.getElementById('voiceStatus');
+  if(!el)return;
+  if(!inCall){el.textContent='';el.className='voice-status';return}
+  const peers=Object.values(PEERS);
+  if(peers.length===0){el.textContent='waiting…';el.className='voice-status warn';return}
+  const states=peers.map(p=>p.pc.connectionState);
+  const connected=states.filter(s=>s==='connected').length;
+  const failed=states.filter(s=>s==='failed'||s==='disconnected').length;
+  if(failed>0){el.textContent='connection failed';el.className='voice-status err'}
+  else if(connected===peers.length){el.textContent='connected · '+connected;el.className='voice-status ok'}
+  else{el.textContent='connecting · '+connected+'/'+peers.length;el.className='voice-status warn'}
+}
 
 function renderVoiceRoster(state){
   const roster=document.getElementById('voiceRoster');
@@ -994,34 +1011,34 @@ function renderVoiceRoster(state){
 async function toggleVoice(){
   if(!playerId||!roomCode)return;
   if(inCall){await leaveVoice();return}
-  await loadShield();
+  try{await loadShield()}catch(e){toast('Encryption setup failed');return}
   await publishKey();
   await refreshIceServers();
   try{myStream=await navigator.mediaDevices.getUserMedia({audio:HQ_AUDIO_CONSTRAINTS,video:false})}
   catch(e){
-
     try{myStream=await navigator.mediaDevices.getUserMedia({audio:true,video:false})}
-    catch(e2){toast('Microphone permission denied');return}
+    catch(e2){toast('Microphone access denied');return}
   }
-
-  myStream.getAudioTracks().forEach(t=>{try{t.contentHint='music'}catch(e){}});
+  myStream.getAudioTracks().forEach(t=>{try{t.contentHint='speech'}catch(e){}});
   inCall=true;muted=false;
-  updateVoiceButton();
+  updateVoiceButton();updateVoiceStatus();
+  bumpPollSpeed();
   await fetch('/api/voice-state',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({gameId:roomCode,playerId,inCall:true})}).catch(()=>{});
-
   if(lastState){
     for(const p of lastState.players||[]){
       if(p.isMe||!p.inCall||!p.dhPub||!p.id)continue;
       await connectToPeer(p,true);
     }
   }
+  updateVoiceStatus();
 }
 async function leaveVoice(){
   inCall=false;muted=false;
   for(const pid of Object.keys(PEERS))closePeer(pid);
   if(myStream){myStream.getTracks().forEach(t=>t.stop());myStream=null}
-  updateVoiceButton();
+  updateVoiceButton();updateVoiceStatus();
+  bumpPollSpeed();
   await fetch('/api/voice-state',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({gameId:roomCode,playerId,inCall:false})}).catch(()=>{});
 }
@@ -1045,17 +1062,36 @@ async function connectToPeer(player,isInitiator){
   if(PEERS[player.id])return PEERS[player.id];
   const pc=new RTCPeerConnection(ICE_CONFIG);
   const audioEl=document.createElement('audio');
-  audioEl.autoplay=true;audioEl.playsInline=true;
+  audioEl.autoplay=true;audioEl.playsInline=true;audioEl.controls=false;
+  audioEl.style.display='none';
   document.body.appendChild(audioEl);
   for(const track of myStream.getTracks())pc.addTrack(track,myStream);
-  pc.ontrack=e=>{audioEl.srcObject=e.streams[0]};
+  pc.ontrack=e=>{
+    audioEl.srcObject=e.streams[0];
+    const tryPlay=()=>audioEl.play().catch(err=>{
+      console.warn('audio play blocked, will retry on user gesture',err);
+      const onGesture=()=>{audioEl.play().catch(()=>{});window.removeEventListener('click',onGesture);window.removeEventListener('touchstart',onGesture)};
+      window.addEventListener('click',onGesture,{once:true});
+      window.addEventListener('touchstart',onGesture,{once:true});
+    });
+    tryPlay();
+    setTimeout(tryPlay,200);
+  };
   pc.onicecandidate=async e=>{
     if(e.candidate)await sendVoiceSignal(player.id,player.dhPub,{type:'ice',candidate:e.candidate.toJSON?e.candidate.toJSON():e.candidate});
   };
   pc.onconnectionstatechange=()=>{
+    console.log('[voice] peer',player.id,'state:',pc.connectionState);
+    updateVoiceStatus();
+    if(pc.connectionState==='failed')toast('Voice connection failed — check network');
     if(pc.connectionState==='failed'||pc.connectionState==='closed')closePeer(player.id);
   };
+  pc.oniceconnectionstatechange=()=>{
+    console.log('[voice] ice',player.id,':',pc.iceConnectionState);
+    updateVoiceStatus();
+  };
   PEERS[player.id]={pc,audioEl,dhPub:player.dhPub};
+  updateVoiceStatus();
   if(isInitiator){
     const offer=await pc.createOffer();
     const sdp=boostOpusSdp(offer.sdp);
