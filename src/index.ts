@@ -4,20 +4,10 @@ export interface Env {
   GAME_ROOM: DurableObjectNamespace;
   STATS: DurableObjectNamespace;
   ASSETS?: { fetch: (req: Request) => Promise<Response> };
-  // Cloudflare Realtime TURN credentials. When both are set, the worker
-  // mints short-lived TURN creds via /api/turn-creds. If unset, voice
-  // still works via STUN — this just means slightly worse coverage on
-  // strict NATs.
+
   REALTIME_TURN_KEY_ID?: string;
   REALTIME_TURN_TOKEN?: string;
 }
-
-// ============================================================
-// DECK — Official Flip 7 composition (94 cards)
-// Number: 0×1, 1×1, 2×2, 3×3, 4×4, 5×5, 6×6, 7×7, 8×8, 9×9, 10×10, 11×11, 12×12
-// Modifier: +2, +4, +6, +8, +10, x2 (6 total)
-// Action: Freeze×3, Flip Three×3, Second Chance×3 (9 total)
-// ============================================================
 
 type CardType = 'number' | 'modifier' | 'action';
 type ActionKind = 'freeze' | 'flip3' | 'second-chance';
@@ -67,20 +57,19 @@ interface PlayerState {
   flipped7: boolean;
   pendingFlip3: number;
   pendingAction: Card | null;
-  // Shield identity public keys (base64). Set by client after WASM init.
+
   dhPub?: string;
   signingPub?: string;
-  // Voice call state
+
   inCall?: boolean;
-  // Pending voice signaling envelopes addressed to this player.
-  // Each is a sealed-sender envelope (Shield) carrying SDP/ICE.
+
   signals?: VoiceSignal[];
 }
 
 interface VoiceSignal {
   id: string;
   fromPlayerId: string;
-  envelope: string; // base64 sealed-sender envelope
+  envelope: string;
   createdAt: number;
 }
 
@@ -88,8 +77,7 @@ interface ChatMessage {
   id: string;
   senderId: string;
   senderName: string;
-  // Map of recipient dhPub → base64 sealed-sender envelope.
-  // Each player decrypts only the entry whose key matches their own dhPub.
+
   envByDh: Record<string, string>;
   createdAt: number;
 }
@@ -111,8 +99,8 @@ interface GameState {
 }
 
 const CHAT_MAX = 100;
-const CHAT_MAX_LEN = 4096; // ciphertext is bigger than plaintext
-const SIGNAL_MAX_LEN = 16384; // SDP can be ~3-5 KB; allow headroom
+const CHAT_MAX_LEN = 4096;
+const SIGNAL_MAX_LEN = 16384;
 
 function generateCode(): string {
   const c = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -146,7 +134,7 @@ function createGame(): GameState {
 }
 
 function drawCard(game: GameState): Card | null {
-  // If deck empty, reshuffle discard pile (official rule)
+
   if (game.deck.length === 0) {
     if (game.discardPile.length === 0) return null;
     game.deck = shuffle(game.discardPile);
@@ -170,21 +158,18 @@ function hasNumberDuplicate(player: PlayerState, newCard: Card): boolean {
 
 function calcRoundScore(player: PlayerState): number {
   const numCards = getNumberCards(player);
-  // 1. Sum of number card values
+
   let numSum = numCards.reduce((s, c) => s + (c.value ?? 0), 0);
 
-  // 2. If x2 modifier, double the number sum first
   const hasX2 = player.cards.some(c => c.type === 'modifier' && c.modifier === 'x2');
   if (hasX2) numSum *= 2;
 
-  // 3. Add other modifier bonuses
   const modTotal = player.cards
     .filter(c => c.type === 'modifier' && c.modifier !== 'x2')
     .reduce((s, c) => s + parseInt(c.modifier!.replace('+', '')), 0);
 
   let total = numSum + modTotal;
 
-  // 4. Flip 7 bonus: 7 unique number cards = +15
   if (getUniqueNumberCount(player) >= 7) total += 15;
 
   return total;
@@ -225,7 +210,7 @@ function endRound(game: GameState): void {
       game.phase = 'game-over';
       game.winner = winners[0].name;
     } else {
-      // Tie at 200+ — play another round
+
       game.phase = 'round-end';
     }
   } else {
@@ -240,7 +225,6 @@ function endRound(game: GameState): void {
 function startNewRound(game: GameState): void {
   game.round++;
 
-  // Official rule: cards from previous round go to discard (not reshuffled)
   for (const p of game.players) {
     game.discardPile.push(...p.cards);
     p.cards = [];
@@ -254,10 +238,8 @@ function startNewRound(game: GameState): void {
     p.pendingAction = null;
   }
 
-  // Rotate dealer (pass deck to the left)
   game.dealerIdx = (game.dealerIdx + 1) % game.players.length;
 
-  // If deck is running low, reshuffle discard into deck
   if (game.deck.length < game.players.length * 3) {
     game.deck = shuffle([...game.deck, ...game.discardPile]);
     game.discardPile = [];
@@ -266,26 +248,23 @@ function startNewRound(game: GameState): void {
   game.phase = 'playing';
   game.lastEvent = null;
 
-  // Deal one card to each player starting from left of dealer
   for (let i = 0; i < game.players.length; i++) {
     const idx = (game.dealerIdx + 1 + i) % game.players.length;
     const card = drawCard(game);
     if (card) dealCardToPlayer(game, game.players[idx], card);
   }
 
-  // First active player after dealer starts
   game.currentPlayerIdx = (game.dealerIdx + 1) % game.players.length;
   if (!isPlayerActive(game.players[game.currentPlayerIdx])) {
     advanceToNextPlayer(game);
   }
 }
 
-// Deal a card to a player, handling all card types per official rules
 function dealCardToPlayer(game: GameState, player: PlayerState, card: Card): string | null {
-  // === SECOND CHANCE ===
+
   if (card.type === 'action' && card.action === 'second-chance') {
     if (player.hasSecondChance) {
-      // Official rule: must give to another active player without one, or discard
+
       const validTarget = game.players.find(p =>
         p.id !== player.id && isPlayerActive(p) && !p.hasSecondChance
       );
@@ -303,7 +282,6 @@ function dealCardToPlayer(game: GameState, player: PlayerState, card: Card): str
     return `${player.name} drew Second Chance 🛡️`;
   }
 
-  // === FREEZE / FLIP THREE ===
   if (card.type === 'action' && (card.action === 'freeze' || card.action === 'flip3')) {
     player.pendingAction = card;
     player.cards.push(card);
@@ -311,18 +289,17 @@ function dealCardToPlayer(game: GameState, player: PlayerState, card: Card): str
     return `${player.name} drew ${name} — choose a target!`;
   }
 
-  // === NUMBER CARD ===
   if (card.type === 'number') {
     if (hasNumberDuplicate(player, card)) {
       if (player.hasSecondChance) {
-        // Second Chance saves from bust
+
         player.hasSecondChance = false;
         const scIdx = player.cards.findIndex(c => c.type === 'action' && c.action === 'second-chance');
         if (scIdx >= 0) {
           game.discardPile.push(player.cards[scIdx]);
           player.cards.splice(scIdx, 1);
         }
-        game.discardPile.push(card); // duplicate goes to discard
+        game.discardPile.push(card);
         return `${player.name} drew duplicate ${card.value} but Second Chance saved them! 🛡️`;
       } else {
         player.cards.push(card);
@@ -333,11 +310,10 @@ function dealCardToPlayer(game: GameState, player: PlayerState, card: Card): str
 
     player.cards.push(card);
 
-    // Check for FLIP 7 — auto-ends round for everyone!
     if (getUniqueNumberCount(player) >= 7) {
       player.flipped7 = true;
       player.stayed = true;
-      // End round immediately for ALL players
+
       endRound(game);
       return `🎉 ${player.name} got FLIP 7!!! Round over for everyone!`;
     }
@@ -345,7 +321,6 @@ function dealCardToPlayer(game: GameState, player: PlayerState, card: Card): str
     return `${player.name} drew a ${card.value}`;
   }
 
-  // === MODIFIER CARD ===
   player.cards.push(card);
   if (card.type === 'modifier') {
     return `${player.name} drew ${card.modifier}`;
@@ -353,7 +328,6 @@ function dealCardToPlayer(game: GameState, player: PlayerState, card: Card): str
   return null;
 }
 
-// Resolve Flip Three — official rules: draw 3, queue nested actions
 function resolveFlipThree(game: GameState, target: PlayerState): string[] {
   const events: string[] = [];
   const queuedActions: Card[] = [];
@@ -364,7 +338,6 @@ function resolveFlipThree(game: GameState, target: PlayerState): string[] {
     if (!c) break;
     cardsDrawn++;
 
-    // Official rule: Freeze/Flip Three drawn during Flip Three resolve AFTER
     if (c.type === 'action' && (c.action === 'freeze' || c.action === 'flip3')) {
       target.cards.push(c);
       queuedActions.push(c);
@@ -373,7 +346,6 @@ function resolveFlipThree(game: GameState, target: PlayerState): string[] {
       continue;
     }
 
-    // Second Chance can be used immediately during Flip Three
     if (c.type === 'action' && c.action === 'second-chance') {
       if (target.hasSecondChance) {
         const validTarget = game.players.find(p =>
@@ -395,26 +367,22 @@ function resolveFlipThree(game: GameState, target: PlayerState): string[] {
       continue;
     }
 
-    // Normal card (number or modifier)
     const ev = dealCardToPlayer(game, target, c);
     if (ev) events.push(ev);
 
-    // Stop if Flip 7 triggered or bust
     if (game.phase !== 'playing' || target.busted) break;
   }
 
   target.pendingFlip3 = 0;
 
-  // Resolve queued actions if target didn't bust
   if (!target.busted && game.phase === 'playing' && queuedActions.length > 0) {
-    // Set first queued action as pending for the target to resolve
+
     target.pendingAction = queuedActions[0];
-    // Note: if there are multiple queued actions, they'd need to be resolved
-    // one at a time. For simplicity, additional ones are auto-resolved on self.
+
     for (let i = 1; i < queuedActions.length; i++) {
       const qa = queuedActions[i];
       if (qa.action === 'freeze') {
-        // Auto-freeze self if multiple queued
+
         target.frozen = true;
         target.stayed = true;
         events.push(`${target.name} was auto-frozen`);
@@ -443,7 +411,7 @@ function filterForPlayer(game: GameState, playerId: string | null): any {
         id: m.id,
         senderName: m.senderName,
         senderId: m.senderId,
-        // Only ship the envelope addressed to this caller
+
         envelope: myDh && m.envByDh ? (m.envByDh[myDh] ?? null) : null,
         createdAt: m.createdAt,
         isMe: !!playerId && m.senderId === playerId,
@@ -474,7 +442,7 @@ function filterForPlayer(game: GameState, playerId: string | null): any {
       isDealer: i === game.dealerIdx,
       isMe: p.id === playerId,
     })),
-    // Voice signals addressed to this player; client should drain these
+
     signals: (() => {
       if (!playerId) return [];
       const me = game.players.find(p => p.id === playerId);
@@ -499,10 +467,6 @@ function newPlayer(id: string, name: string): PlayerState {
     pendingFlip3: 0, pendingAction: null,
   };
 }
-
-// ============================================================
-// Durable Object — one instance per game room
-// ============================================================
 
 export class Flip7Room {
   private state: DurableObjectState;
@@ -535,9 +499,9 @@ export class Flip7Room {
     const stored = (await this.state.storage.get<GameState>('game')) ?? null;
     if (stored) {
       if (!Array.isArray(stored.chat)) stored.chat = [];
-      // Drop legacy plaintext chat (no envByDh) — incompatible with E2EE schema
+
       stored.chat = stored.chat.filter(m => m && (m as any).envByDh && typeof (m as any).envByDh === 'object');
-      // Ensure each player has signals array (older saves don't have it)
+
       for (const p of stored.players) {
         if (!Array.isArray(p.signals)) p.signals = [];
       }
@@ -547,7 +511,7 @@ export class Flip7Room {
   }
   private async save(): Promise<void> {
     if (!this.game) return;
-    // Record win exactly once when phase first reaches game-over
+
     if (this.game.phase === 'game-over' && this.game.winner && !this.game.winRecorded) {
       this.game.winRecorded = true;
       await this.recordWin(
@@ -660,8 +624,8 @@ export class Flip7Room {
     const card = drawCard(game);
     if (!card) return json({ error: 'Deck empty' }, 400);
     game.lastEvent = dealCardToPlayer(game, player, card);
-    if (game.phase !== 'playing') { /* round ended */ }
-    else if (player.pendingAction) { /* wait for action target */ }
+    if (game.phase !== 'playing') {  }
+    else if (player.pendingAction) {  }
     else { advanceToNextPlayer(game); }
     await this.save();
     return json(filterForPlayer(game, body.playerId));
@@ -709,7 +673,7 @@ export class Flip7Room {
     if (game.phase === 'playing') {
       const cur = game.players[game.currentPlayerIdx];
       if (cur.id === body.playerId && !cur.pendingAction) {
-        // After resolving action, advance (1 card per turn rule)
+
         advanceToNextPlayer(game);
       }
       if (!game.players.some(isPlayerActive) && game.phase === 'playing') endRound(game);
@@ -735,8 +699,7 @@ export class Flip7Room {
     if (!game) return json({ error: 'Game not found' }, 404);
     const g = createGame();
     g.roomCode = game.roomCode;
-    // Carry over players AND their published Shield keys / call state so chat
-    // and voice keep working across rounds.
+
     g.players = game.players.map(p => {
       const np = newPlayer(p.id, p.name);
       np.dhPub = p.dhPub;
@@ -753,16 +716,14 @@ export class Flip7Room {
   }
 
   private async doChat(request: Request): Promise<Response> {
-    // Encrypted chat: client provides one sealed-sender envelope per recipient
-    // (keyed by recipient dhPub). The server stores the bag of envelopes; each
-    // poller only sees the envelope addressed to them.
+
     const body = await request.json() as { playerId: string; envByDh: Record<string, string> };
     const game = await this.load();
     if (!game) return json({ error: 'Game not found' }, 404);
     const player = game.players.find(p => p.id === body.playerId);
     if (!player) return json({ error: 'Player not in this room' }, 403);
     if (!body.envByDh || typeof body.envByDh !== 'object') return json({ error: 'envByDh required' }, 400);
-    // Only accept envelopes addressed to known recipients, and cap size
+
     const sanitized: Record<string, string> = {};
     const knownDhs = new Set(game.players.map(p => p.dhPub).filter(Boolean) as string[]);
     for (const [dh, env] of Object.entries(body.envByDh)) {
@@ -807,14 +768,13 @@ export class Flip7Room {
     const player = game.players.find(p => p.id === body.playerId);
     if (!player) return json({ error: 'Player not in this room' }, 403);
     player.inCall = !!body.inCall;
-    if (!player.inCall) player.signals = []; // drop any pending signals on leave
+    if (!player.inCall) player.signals = [];
     await this.save();
     return json(filterForPlayer(game, body.playerId));
   }
 
   private async doVoiceSignal(request: Request): Promise<Response> {
-    // Send a Shield-encrypted signaling envelope (offer / answer / ICE) to a
-    // specific peer. The worker is just a relay — it cannot decrypt the body.
+
     const body = await request.json() as { playerId: string; toPlayerId: string; envelope: string };
     const game = await this.load();
     if (!game) return json({ error: 'Game not found' }, 404);
@@ -832,14 +792,14 @@ export class Flip7Room {
       envelope: body.envelope,
       createdAt: Date.now(),
     });
-    // Cap to last 200 to avoid runaway storage on stuck clients
+
     if (recipient.signals.length > 200) recipient.signals = recipient.signals.slice(-200);
     await this.save();
     return json({ ok: true });
   }
 
   private async doVoiceDrain(request: Request): Promise<Response> {
-    // Client confirms it has consumed signal IDs up through the supplied list.
+
     const body = await request.json() as { playerId: string; ids: string[] };
     const game = await this.load();
     if (!game) return json({ error: 'Game not found' }, 404);
@@ -853,10 +813,6 @@ export class Flip7Room {
     return json(filterForPlayer(game, body.playerId));
   }
 }
-
-// ============================================================
-// Worker entry — routes to Durable Object
-// ============================================================
 
 function getStub(env: Env, roomCode: string): DurableObjectStub {
   const id = env.GAME_ROOM.idFromName(roomCode.toUpperCase());
@@ -873,10 +829,6 @@ function fwd(env: Env, code: string, action: string, request: Request, body?: an
   }));
 }
 
-// ============================================================
-// Stats DO — single instance ('global') tracking all wins
-// ============================================================
-
 interface WinEntry {
   winnerName: string;
   roomCode: string;
@@ -890,9 +842,7 @@ export class Flip7Stats {
   constructor(state: DurableObjectState) { this.state = state; }
 
   private async loadWins(): Promise<WinEntry[]> {
-    // One-time backfill of remembered wins (Aryan x2, AJ x1) the first
-    // time this DO is read. Self-locking via the 'seeded:v1' flag so
-    // it never runs again.
+
     const seeded = await this.state.storage.get<boolean>('seeded:v1');
     const existing = (await this.state.storage.get<WinEntry[]>('wins')) ?? [];
     if (!seeded) {
@@ -923,7 +873,7 @@ export class Flip7Stats {
         finalScore: body.players?.find(p => p.name === body.winnerName)?.totalScore,
         finishedAt: body.finishedAt || Date.now(),
       });
-      // Keep last 1000 to bound storage
+
       const trimmed = wins.slice(-1000);
       await this.state.storage.put('wins', trimmed);
       return json({ ok: true, count: trimmed.length });
@@ -937,7 +887,7 @@ export class Flip7Stats {
 }
 
 function renderWinsPage(wins: WinEntry[]): string {
-  // Aggregate by name
+
   const tally: Record<string, { wins: number; latest: number }> = {};
   for (const w of wins) {
     const k = w.winnerName;
@@ -998,7 +948,6 @@ export default {
       return new Response(getHTML(), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
     }
 
-    // Secret wins page
     if (request.method === 'GET' && pathname === '/wins') {
       const stub = env.STATS.get(env.STATS.idFromName('global'));
       const res = await stub.fetch('https://stats/list');
@@ -1014,19 +963,20 @@ export default {
       return json(wins);
     }
 
-    // TURN credentials — short-lived ICE servers minted from Cloudflare Realtime.
-    // Returns { iceServers: [...] } shaped for direct use as RTCPeerConnection config.
-    // Falls back to plain STUN if Realtime isn't wired up yet.
     if (request.method === 'GET' && pathname === '/api/turn-creds') {
-      const stunOnly = {
+      const baseFallback = {
         iceServers: [
           { urls: 'stun:stun.cloudflare.com:3478' },
           { urls: 'stun:stun.l.google.com:19302' },
+
+          { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
+          { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
+          { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
         ],
       };
       const keyId = env.REALTIME_TURN_KEY_ID;
       const token = env.REALTIME_TURN_TOKEN;
-      if (!keyId || !token) return json(stunOnly);
+      if (!keyId || !token) return json(baseFallback);
       try {
         const r = await fetch(
           `https://rtc.live.cloudflare.com/v1/turn/keys/${keyId}/credentials/generate-ica`,
@@ -1039,22 +989,20 @@ export default {
             body: JSON.stringify({ ttl: 43200 }),
           },
         );
-        if (!r.ok) return json(stunOnly);
+        if (!r.ok) return json(baseFallback);
         const data: any = await r.json();
-        // Cloudflare returns either { iceServers: { urls, username, credential } }
-        // or { iceServers: [ { urls, username, credential } ] } depending on
-        // endpoint version. Normalize both shapes.
+
         let turn: any = data?.iceServers;
         if (turn && !Array.isArray(turn)) turn = [turn];
-        if (!Array.isArray(turn) || turn.length === 0) return json(stunOnly);
+        if (!Array.isArray(turn) || turn.length === 0) return json(baseFallback);
         return json({
           iceServers: [
-            ...stunOnly.iceServers,
+            ...baseFallback.iceServers,
             ...turn,
           ],
         });
       } catch {
-        return json(stunOnly);
+        return json(baseFallback);
       }
     }
 
@@ -1070,7 +1018,6 @@ export default {
       return fwd(env, code, `?action=state&playerId=${pid}`, request);
     }
 
-    // All POST actions: extract gameId, forward body
     const postActions: Record<string, string> = {
       '/api/join': 'join', '/api/start': 'start', '/api/hit': 'hit',
       '/api/stay': 'stay', '/api/action': 'action',

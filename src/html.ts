@@ -295,7 +295,7 @@ export function getHTML(): string {
 <div class="container">
   <header><h1>FLIP 7</h1><p class="sub" id="headerSub">(for Self glazers)</p></header>
 
-  <!-- LANDING -->
+  
   <div class="screen active" id="sLanding">
     <div class="box">
       <div class="rejoin-banner" id="rejoinBanner" style="display:none">
@@ -313,7 +313,7 @@ export function getHTML(): string {
     </div>
   </div>
 
-  <!-- LOBBY -->
+  
   <div class="screen" id="sLobby">
     <div class="box">
       <div style="font-size:.7rem;color:var(--muted);text-transform:uppercase;letter-spacing:.1em">Room</div>
@@ -340,7 +340,7 @@ export function getHTML(): string {
     </div>
   </div>
 
-  <!-- GAME -->
+  
   <div class="screen" id="sGame">
     <div class="event-bar" id="eventBar" style="display:none"></div>
     <div class="turn-bar" id="turnBar"></div>
@@ -355,13 +355,13 @@ export function getHTML(): string {
     <div class="actions-row" id="actionsRow"></div>
   </div>
 
-  <!-- ROUND END -->
+  
   <div class="screen" id="sRoundEnd"><div class="round-box" id="roundSummary"></div></div>
 
-  <!-- GAME OVER -->
+  
   <div class="screen" id="sGameOver"><div class="go-box" id="gameOverBox"></div></div>
 
-  <!-- CHAT (visible while in a room) -->
+  
   <div class="chat-panel" id="chatPanel" style="display:none">
     <div class="chat-header">
       <span class="ch-title">
@@ -396,11 +396,10 @@ export function getHTML(): string {
 <script>
 let roomCode=null,playerId=null,pollInterval=null,lastJSON='',joined=false;
 let shieldReady=false,shieldLoading=null,myIdentity=null,myDhPub=null,publishedKeyForRoom=null,lastState=null;
-let SHIELD={}; // populated by loadShield()
-const PEERS={}; // playerId -> { pc, audioEl, dhPub }
+let SHIELD={};
+const PEERS={};
 let myStream=null,inCall=false,muted=false;
 
-// ===== Shield (E2E encryption) =====
 async function loadShield(){
   if(shieldReady)return;
   if(shieldLoading)return shieldLoading;
@@ -445,15 +444,11 @@ function decryptForMe(envelope){
   catch(e){return null}
 }
 
-// Session persistence
 function saveSession(){
   if(roomCode&&playerId){localStorage.setItem('f7_room',roomCode);localStorage.setItem('f7_pid',playerId)}
 }
 function clearSession(){localStorage.removeItem('f7_room');localStorage.removeItem('f7_pid')}
 
-// Check saved session — validate and show a "Rejoin / Start Fresh" prompt on the
-// landing screen instead of auto-jumping into the game. Closing the tab and
-// reopening always lands on the home screen.
 (function checkSavedSession(){
   const r=localStorage.getItem('f7_room'),p=localStorage.getItem('f7_pid');
   if(!r||!p)return;
@@ -466,7 +461,7 @@ function clearSession(){localStorage.removeItem('f7_room');localStorage.removeIt
     document.getElementById('rejoinBanner').style.display='block';
     const ji=document.getElementById('joinCode');
     if(ji&&!ji.value)ji.value=r;
-  }).catch(()=>{/* offline — leave banner hidden */});
+  }).catch(()=>{});
 })();
 
 function rejoinSavedRoom(){
@@ -500,7 +495,7 @@ function dismissSavedRoom(){
 }
 
 function newRoom(){
-  // Tear down voice + reset chat state so the next room starts clean
+
   if(inCall)void leaveVoice();
   for(const pid of Object.keys(PEERS))closePeer(pid);
   clearSession();
@@ -544,7 +539,7 @@ function joinGame(){
     if(d.error){toast(d.error);return}
     playerId=d.playerId;joined=true;saveSession();
     document.getElementById('nameRow').style.display='none';renderLobby(d.game);
-    // Publish encryption key now that we have an identity in this room
+
     void publishKey();
   }).catch(()=>toast('Failed'));
 }
@@ -575,7 +570,6 @@ function api(endpoint,body){
   }).catch(()=>toast('Failed'));
 }
 
-// ===== RENDER LOBBY =====
 function renderLobby(s){
   const el=document.getElementById('lobbyPlayers');el.innerHTML='';
   (s.players||[]).forEach((p,i)=>{
@@ -597,17 +591,16 @@ function renderLobby(s){
   void processIncomingSignals(s.signals||[]);
 }
 
-// ===== RENDER GAME STATE =====
 function renderState(s){
   lastState=s;
   renderChat(s);
   renderVoiceRoster(s);
   updateChatInputState();
-  // Re-publish key once we have a player id but server doesn't know our key yet
+
   if(playerId&&!publishedKeyForRoom)void publishKey();
-  // Drive WebRTC: connect to anyone in call we don't yet have a peer for
+
   void reconcilePeers(s);
-  // Process any signal envelopes addressed to us
+
   void processIncomingSignals(s.signals||[]);
   if(s.phase==='lobby'){show('sLobby');renderLobby(s);return}
   if(s.phase==='game-over'){show('sGameOver');renderGameOver(s);return}
@@ -616,11 +609,9 @@ function renderState(s){
   show('sGame');
   document.getElementById('headerSub').textContent='Room: '+roomCode;
 
-  // Event bar
   const eb=document.getElementById('eventBar');
   if(s.lastEvent){eb.style.display='block';eb.textContent=s.lastEvent}else{eb.style.display='none'}
 
-  // Turn bar
   const tb=document.getElementById('turnBar');
   const cur=s.players[s.currentPlayerIdx];
   const me=s.players.find(p=>p.isMe);
@@ -642,17 +633,15 @@ function renderState(s){
   }else{
     tb.className='turn-bar waiting';
     tb.textContent=cur?esc(cur.name)+'\\'s turn...':'Waiting...';
+
   }
 
-  // Table info
   document.getElementById('roundBadge').textContent='Round '+s.round;
   document.getElementById('deckCount').textContent=s.deckSize+' left';
 
-  // Player areas — show ALL players' cards (like real table!)
   const grid=document.getElementById('playersGrid');
   grid.innerHTML='';
 
-  // Put "me" last so I'm always at the bottom
   const ordered=[...s.players.filter(p=>!p.isMe),...s.players.filter(p=>p.isMe)];
 
   ordered.forEach((p,idx)=>{
@@ -687,7 +676,6 @@ function renderState(s){
     grid.appendChild(el);
   });
 
-  // Actions
   const ar=document.getElementById('actionsRow');ar.innerHTML='';
   if(me&&isMyTurn&&!me.busted&&!me.stayed&&!me.frozen){
     if(me.hasPendingAction){
@@ -700,7 +688,6 @@ function renderState(s){
   }
 }
 
-// ===== CARD RENDERING =====
 function renderCards(cards){
   return cards.map(c=>{
     if(c.type==='number'){
@@ -745,16 +732,10 @@ function showActionModal(s,actionType){
 }
 
 function findPid(s,name){
-  // Since we stripped IDs from others, we need another way...
-  // The backend expects targetId. For non-self players, we don't have their ID.
-  // Let's use name-based targeting instead.
-  // Actually, the backend filter includes id only for "me". For others it's undefined.
-  // We need to change the action endpoint to accept targetName too.
-  // For now, let's pass the name and handle it.
+
   return name;
 }
 
-// ===== ROUND END =====
 function renderRoundEnd(s){
   const el=document.getElementById('roundSummary');
   let html='<h2>Round '+s.round+' Complete</h2>';
@@ -773,7 +754,6 @@ function renderRoundEnd(s){
   el.innerHTML=html;
 }
 
-// ===== GAME OVER =====
 function renderGameOver(s){
   const el=document.getElementById('gameOverBox');
   const sorted=[...s.players].sort((a,b)=>b.totalScore-a.totalScore);
@@ -794,7 +774,6 @@ function renderGameOver(s){
   confetti();
 }
 
-// ===== HELPERS =====
 function calcScore(p){
   const nums=p.cards.filter(c=>c.type==='number');
   let sum=nums.reduce((s,c)=>s+(c.value||0),0);
@@ -824,7 +803,7 @@ function show(id){
   document.querySelectorAll('.screen').forEach(s=>s.classList.remove('active'));
   document.getElementById(id).classList.add('active');
   if(id!=='sLanding')document.getElementById('headerSub').textContent='Room: '+(roomCode||'');
-  // Show chat in lobby/game/round-end/game-over (anywhere we are inside a room)
+
   const cp=document.getElementById('chatPanel');
   if(cp)cp.style.display=(id==='sLanding')?'none':'block';
   updateChatInputState();
@@ -843,7 +822,7 @@ function updateChatInputState(){
 }
 
 let lastChatId='',lastChatMsgs=null;
-const decryptedCache={}; // msg.id -> plaintext
+const decryptedCache={};
 function renderChat(state){
   const log=document.getElementById('chatLog');
   if(!log)return;
@@ -875,9 +854,9 @@ async function sendChat(){
   const text=input.value.trim();
   if(!text||!roomCode||!playerId)return;
   if(!shieldReady){await loadShield();await publishKey()}
-  // Encrypt for every player who has a key (and ourselves so we can decrypt our own messages from history)
+
   const players=(lastState&&lastState.players)?lastState.players.filter(p=>p.dhPub):[];
-  // Make sure we're included so re-renders can decrypt our own
+
   if(myDhPub&&!players.some(p=>p.dhPub===myDhPub))players.push({dhPub:myDhPub});
   const envByDh=encryptForRoom(text,players);
   if(!envByDh||Object.keys(envByDh).length===0){toast('Waiting for keys…');return}
@@ -893,7 +872,6 @@ document.getElementById('chatInput').addEventListener('keydown',e=>{
   if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendChat()}
 });
 
-// ===== Chat panel collapse / toggle =====
 function chatVisible(){const v=localStorage.getItem('f7_chat_visible');return v===null?true:v==='1'}
 function toggleChatPanel(){
   const cur=chatVisible();
@@ -912,12 +890,11 @@ function applyChatVisibility(){
   panel.classList.toggle('collapsed',!v);
 }
 applyChatVisibility();
-// ===== Voice (WebRTC mesh, Shield-encrypted signaling) =====
-// High-fidelity audio: stereo Opus at 510 kbps / 48 kHz, all browser DSP off.
+
 let ICE_CONFIG={iceServers:[{urls:'stun:stun.cloudflare.com:3478'},{urls:'stun:stun.l.google.com:19302'}]};
 let iceFetchedAt=0;
 async function refreshIceServers(){
-  // Cache for 11 hours (TURN creds are minted with 12h TTL)
+
   if(Date.now()-iceFetchedAt<11*3600*1000)return;
   try{
     const r=await fetch('/api/turn-creds');
@@ -926,7 +903,7 @@ async function refreshIceServers(){
       ICE_CONFIG={iceServers:d.iceServers};
       iceFetchedAt=Date.now();
     }
-  }catch(e){/* keep STUN-only fallback */}
+  }catch(e){}
 }
 const AUDIO_BITRATE=510000;
 const HQ_AUDIO_CONSTRAINTS={
@@ -940,15 +917,13 @@ const HQ_AUDIO_CONSTRAINTS={
 };
 const drainQueue=new Set();
 
-// Patch outgoing SDP so Opus advertises stereo + max-quality params on both
-// sides of the negotiation. Without this, browsers default to mono ~32 kbps.
 function boostOpusSdp(sdp){
   if(!sdp)return sdp;
-  const lines=sdp.split(/\r?\n/);
-  // Find every Opus payload type (there can be multiple — e.g. red, telephone-event)
+  const lines=sdp.split(/\\r?\\n/);
+
   const opusPts=[];
   for(const l of lines){
-    const m=l.match(/^a=rtpmap:(\d+) opus\/48000/i);
+    const m=l.match(/^a=rtpmap:(\\d+) opus\\/48000/i);
     if(m)opusPts.push(m[1]);
   }
   if(opusPts.length===0)return sdp;
@@ -966,13 +941,13 @@ function boostOpusSdp(sdp){
     }
     if(!replaced)out.push(l);
   }
-  // Insert fmtp lines for any Opus PT that didn't already have one
+
   for(const pt of opusPts){
     if(seenFmtp.has(pt))continue;
     const i=out.findIndex(l=>new RegExp('^a=rtpmap:'+pt+' opus').test(l));
     if(i>=0)out.splice(i+1,0,'a=fmtp:'+pt+' '+params);
   }
-  return out.join('\r\n');
+  return out.join('\\r\\n');
 }
 
 async function maxAudioBitrate(pc){
@@ -1024,17 +999,17 @@ async function toggleVoice(){
   await refreshIceServers();
   try{myStream=await navigator.mediaDevices.getUserMedia({audio:HQ_AUDIO_CONSTRAINTS,video:false})}
   catch(e){
-    // Fall back to default if the browser refuses our constraints (e.g. stereo unavailable on mobile)
+
     try{myStream=await navigator.mediaDevices.getUserMedia({audio:true,video:false})}
     catch(e2){toast('Microphone permission denied');return}
   }
-  // Tell the encoder to optimize for music-grade fidelity
+
   myStream.getAudioTracks().forEach(t=>{try{t.contentHint='music'}catch(e){}});
   inCall=true;muted=false;
   updateVoiceButton();
   await fetch('/api/voice-state',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({gameId:roomCode,playerId,inCall:true})}).catch(()=>{});
-  // Initiate offers to anyone already in the call
+
   if(lastState){
     for(const p of lastState.players||[]){
       if(p.isMe||!p.inCall||!p.dhPub||!p.id)continue;
@@ -1094,7 +1069,7 @@ async function connectToPeer(player,isInitiator){
 async function reconcilePeers(state){
   if(!inCall||!state)return;
   const inCallSet=new Set((state.players||[]).filter(p=>p.inCall&&!p.isMe&&p.dhPub&&p.id).map(p=>p.id));
-  // Drop peers who left the call
+
   for(const pid of Object.keys(PEERS))if(!inCallSet.has(pid))closePeer(pid);
 }
 
@@ -1135,7 +1110,7 @@ async function processIncomingSignals(signals){
       }
     }catch(e){}
   }
-  // Drain consumed ids on the server
+
   if(drainQueue.size>0){
     const ids=Array.from(drainQueue);drainQueue.clear();
     await fetch('/api/voice-drain',{method:'POST',headers:{'Content-Type':'application/json'},
